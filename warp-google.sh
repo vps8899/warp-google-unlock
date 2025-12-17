@@ -1,7 +1,7 @@
 #!/bin/bash
 # ===================================================
 # Project: WARP Google Unlock (RackNerd/IPv4 Fix)
-# Version: 4.1 (Force Remove IPv6 - Robust)
+# Version: 4.2 (Anti-Duplicate Address Logic)
 # ===================================================
 
 RED='\033[0;31m'
@@ -10,13 +10,8 @@ YELLOW='\033[0;33m'
 SKYBLUE='\033[0;36m'
 NC='\033[0m'
 
-# ===================================================
-# 0. 环境预检
-# ===================================================
 check_env() {
     [[ $EUID -ne 0 ]] && echo -e "${RED}错误：请使用 root 权限运行！${NC}" && exit 1
-    
-    # 检测 TUN 设备
     if [ ! -e /dev/net/tun ]; then
         echo -e "${YELLOW}正在尝试开启 TUN 设备...${NC}"
         mkdir -p /dev/net
@@ -25,14 +20,10 @@ check_env() {
     fi
 }
 
-# ===================================================
-# 1. 安装逻辑
-# ===================================================
 install_warp() {
     check_env
     echo -e "${YELLOW}>>> [1/5] 安装依赖...${NC}"
     
-    # 针对 RackNerd/Debian 系统增加 openresolv 支持
     if [ -f /etc/debian_version ]; then
         apt-get update -y >/dev/null 2>&1
         apt-get install -y wireguard-tools curl wget git lsb-release ufw openresolv >/dev/null 2>&1
@@ -40,14 +31,12 @@ install_warp() {
         yum install -y wireguard-tools curl wget git openresolv >/dev/null 2>&1
     fi
 
-    # 开启转发
     if ! grep -q "net.ipv4.ip_forward = 1" /etc/sysctl.conf; then
         echo "net.ipv4.ip_forward = 1" >> /etc/sysctl.conf
         sysctl -p >/dev/null 2>&1
     fi
 
     echo -e "${YELLOW}>>> [2/5] 注册 WARP 账号...${NC}"
-    # 先清理旧配置
     systemctl stop wg-quick@warp >/dev/null 2>&1
     rm -rf /etc/wireguard/warp_tmp
     
@@ -71,32 +60,26 @@ install_warp() {
     fi
     /usr/local/bin/wgcf generate >/dev/null 2>&1
 
-    echo -e "${YELLOW}>>> [3/5] 优化配置 (强制去除 IPv6)...${NC}"
+    echo -e "${YELLOW}>>> [3/5] 优化配置 (防重复/去IPv6)...${NC}"
     CONF_PATH="/etc/wireguard/warp.conf"
     cp wgcf-profile.conf $CONF_PATH
 
-    # --- 核心修复：强力剔除 IPv6 (v4.1 修正版) ---
-    # RackNerd 等不支持 IPv6 的机器必须删掉 IPv6 地址，否则无法启动
-    # 方法1：直接重写 Address 行为纯 IPv4
-    sed -i "s/^Address.*/Address = 172.16.0.2\/32/" $CONF_PATH
-    
-    # 方法2：兜底清除逗号后面的内容
-    sed -i 's/,.*//g' $CONF_PATH
+    # --- 核心修复：彻底防止重复 Address (v4.2) ---
+    # 逻辑：先删除所有 Address 行，再手动添加一行。
+    # 这样无论原文件格式如何，永远只保留一条正确的配置。
+    sed -i '/^Address/d' $CONF_PATH
+    sed -i '/^PrivateKey/a Address = 172.16.0.2/32' $CONF_PATH
 
     # --- 基础配置修改 ---
-    # 1. 强制 DNS
     sed -i '/DNS/d' $CONF_PATH
     sed -i '/\[Interface\]/a DNS = 8.8.8.8, 1.1.1.1' $CONF_PATH
 
-    # 2. 禁止接管全流量
     sed -i '/Table/d' $CONF_PATH
     sed -i '/\[Interface\]/a Table = off' $CONF_PATH
 
-    # 3. 永久保活
     sed -i '/PersistentKeepalive/d' $CONF_PATH
     sed -i '/\[Peer\]/a PersistentKeepalive = 25' $CONF_PATH
 
-    # 4. 路由脚本钩子
     sed -i '/PostUp/d' $CONF_PATH
     sed -i '/PreDown/d' $CONF_PATH
     sed -i '/\[Interface\]/a PostUp = bash /etc/wireguard/add_google_routes.sh' $CONF_PATH
@@ -138,7 +121,6 @@ SCRIPT_EOF
         ufw allow out 51820/udp >/dev/null 2>&1
     fi
 
-    # 重启接口
     wg-quick down warp >/dev/null 2>&1
     systemctl enable wg-quick@warp >/dev/null 2>&1
     systemctl restart wg-quick@warp
@@ -148,9 +130,6 @@ SCRIPT_EOF
     check_status
 }
 
-# ===================================================
-# 2. 卸载逻辑
-# ===================================================
 uninstall_warp() {
     echo -e "${YELLOW}>>> 正在卸载...${NC}"
     systemctl stop wg-quick@warp >/dev/null 2>&1
@@ -164,9 +143,6 @@ uninstall_warp() {
     echo -e "${GREEN}>>> 卸载完成。${NC}"
 }
 
-# ===================================================
-# 3. 状态检查
-# ===================================================
 check_status() {
     if ! systemctl is-active --quiet wg-quick@warp; then
         echo -e "服务状态: ${RED}未运行 (Failed)${NC}"
@@ -190,9 +166,6 @@ check_status() {
     fi
 }
 
-# ===================================================
-# 菜单入口
-# ===================================================
 clear
 echo -e "${GREEN}=============================================${NC}"
 echo -e "${GREEN}   WARP Google Unlocker (Auto Fix IPv6)      ${NC}"
