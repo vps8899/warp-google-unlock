@@ -1,8 +1,7 @@
-cat > warp_google.sh << 'EOF'
 #!/bin/bash
 # ===================================================
 # Project: WARP Google Unlock (RackNerd/IPv4 Fix)
-# Version: 4.0 (Auto-Fix IPv6 Permission Denied)
+# Version: 4.1 (Force Remove IPv6 - Robust)
 # ===================================================
 
 RED='\033[0;31m'
@@ -31,7 +30,7 @@ check_env() {
 # ===================================================
 install_warp() {
     check_env
-    echo -e "${YELLOW}>>> [1/5] 安装依赖 (修复 RackNerd 缺失组件)...${NC}"
+    echo -e "${YELLOW}>>> [1/5] 安装依赖...${NC}"
     
     # 针对 RackNerd/Debian 系统增加 openresolv 支持
     if [ -f /etc/debian_version ]; then
@@ -48,7 +47,7 @@ install_warp() {
     fi
 
     echo -e "${YELLOW}>>> [2/5] 注册 WARP 账号...${NC}"
-    # 先清理旧配置防止冲突
+    # 先清理旧配置
     systemctl stop wg-quick@warp >/dev/null 2>&1
     rm -rf /etc/wireguard/warp_tmp
     
@@ -72,17 +71,20 @@ install_warp() {
     fi
     /usr/local/bin/wgcf generate >/dev/null 2>&1
 
-    echo -e "${YELLOW}>>> [3/5] 优化配置 (修复 IPv6 报错)...${NC}"
+    echo -e "${YELLOW}>>> [3/5] 优化配置 (强制去除 IPv6)...${NC}"
     CONF_PATH="/etc/wireguard/warp.conf"
     cp wgcf-profile.conf $CONF_PATH
 
-    # --- 核心修复：剔除 IPv6 地址 ---
-    # RackNerd 等不支持 IPv6 的机器会导致 Permission denied
-    # 这行命令会删除 Address 行中逗号后面的部分(即 IPv6 地址)
-    sed -i '/^Address/s/,.*//' $CONF_PATH
+    # --- 核心修复：强力剔除 IPv6 (v4.1 修正版) ---
+    # RackNerd 等不支持 IPv6 的机器必须删掉 IPv6 地址，否则无法启动
+    # 方法1：直接重写 Address 行为纯 IPv4
+    sed -i "s/^Address.*/Address = 172.16.0.2\/32/" $CONF_PATH
+    
+    # 方法2：兜底清除逗号后面的内容
+    sed -i 's/,.*//g' $CONF_PATH
 
     # --- 基础配置修改 ---
-    # 1. 强制 DNS (避免污染)
+    # 1. 强制 DNS
     sed -i '/DNS/d' $CONF_PATH
     sed -i '/\[Interface\]/a DNS = 8.8.8.8, 1.1.1.1' $CONF_PATH
 
@@ -168,7 +170,7 @@ uninstall_warp() {
 check_status() {
     if ! systemctl is-active --quiet wg-quick@warp; then
         echo -e "服务状态: ${RED}未运行 (Failed)${NC}"
-        echo -e "尝试查看日志: systemctl status wg-quick@warp"
+        echo -e "请运行: journalctl -xeu wg-quick@warp 查看错误日志"
         return
     fi
 
@@ -180,7 +182,6 @@ check_status() {
 
     echo -e "WARP 状态: ${GREEN}运行正常 (握手成功)${NC}"
     
-    # 强制使用 IPv4 测试 Gemini
     RESULT=$(curl -sI -4 -o /dev/null -w "%{http_code}" https://gemini.google.com --max-time 5)
     if [ "$RESULT" == "200" ] || [ "$RESULT" == "301" ] || [ "$RESULT" == "302" ]; then
         echo -e "Gemini 解锁: ${GREEN}成功 (Code: $RESULT)${NC}"
@@ -192,8 +193,21 @@ check_status() {
 # ===================================================
 # 菜单入口
 # ===================================================
-install_warp
-EOF
+clear
+echo -e "${GREEN}=============================================${NC}"
+echo -e "${GREEN}   WARP Google Unlocker (Auto Fix IPv6)      ${NC}"
+echo -e "${GREEN}=============================================${NC}"
+echo -e "1. 安装 / 修复 (Install/Repair)"
+echo -e "2. 卸载 (Uninstall)"
+echo -e "3. 检测状态 (Check Status)"
+echo -e "0. 退出 (Exit)"
+echo -e "---------------------------------------------"
+read -p "选择: " choice
 
-# 运行生成的脚本
-bash warp_google.sh
+case $choice in
+    1) install_warp ;;
+    2) uninstall_warp ;;
+    3) check_status ;;
+    0) exit 0 ;;
+    *) echo "无效选项" ;;
+esac
