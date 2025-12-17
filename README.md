@@ -37,4 +37,4 @@
 要求：Root 权限
 
 ```bash
-bash <(curl -sL [https://raw.githubusercontent.com/vps8899/warp-google-unlock/main/warp-google.sh](https://raw.githubusercontent.com/vps8899/warp-google-unlock/main/warp-google.sh))
+bash <(curl -sL https://raw.githubusercontent.com/vps8899/warp-google-unlock/main/warp-google.sh)
