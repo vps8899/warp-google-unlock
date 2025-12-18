@@ -25,7 +25,7 @@
     * **强制锁定 IPv4 Endpoint** (162.159.192.1)，解决因 DNS 解析到 IPv6 导致的握手失败 (Handshake=0) 问题。
 3.  **精细化分流模式 (独家)**
     * **模式 1 (推荐)：** 仅代理 Google 搜索/Gemini/商店。**保留 YouTube 直连**（享受送中 IP 无广告福利）。
-    * **模式 2：** 代理 Google 全家桶（含 YouTube）。适合 IP 彻底被墙无法看视频的情况。
+    * **模式 2：** 代理 Google 全家桶（含 YouTube）。适合 IP 彻底被送中无法看视频的情况。
     * **模式 3：** 包含 Netflix、Disney+、OpenAI 等流媒体规则。
 4.  **极致稳定**
     * 内置 `PersistentKeepalive` 心跳保活，防止 WARP 隧道空闲断连。
