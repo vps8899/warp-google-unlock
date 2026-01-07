@@ -168,9 +168,16 @@ if [ ! -f wgcf-profile.conf ]; then
     exit 1
 fi
 
-# 提取密钥
-PRIVATE_KEY=$(grep PrivateKey wgcf-profile.conf | cut -d= -f2 | tr -d ' ')
-ADDRESS4=$(grep -oP 'Address = \K[0-9./]+' wgcf-profile.conf | head -1)
+# 提取密钥 - 使用 sed 更可靠地处理
+PRIVATE_KEY=$(sed -n 's/^PrivateKey *= *//p' wgcf-profile.conf | tr -d ' \r\n')
+ADDRESS4=$(sed -n 's/^Address *= *\([0-9./]*\).*/\1/p' wgcf-profile.conf | head -1)
+
+# 验证密钥格式
+if [ ${#PRIVATE_KEY} -ne 44 ]; then
+    echo -e "${YELLOW}警告: 密钥长度异常 (${#PRIVATE_KEY})，尝试重新提取...${NC}"
+    # 备用提取方式
+    PRIVATE_KEY=$(awk -F' *= *' '/PrivateKey/{print $2}' wgcf-profile.conf | tr -d ' \r\n')
+fi
 
 echo -e "${GREEN}✓ WARP 账户已注册${NC}"
 
