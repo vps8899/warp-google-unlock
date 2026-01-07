@@ -168,21 +168,13 @@ if [ ! -f wgcf-profile.conf ]; then
     exit 1
 fi
 
-# 提取密钥 - 使用 sed 更可靠地处理
-PRIVATE_KEY=$(sed -n 's/^PrivateKey *= *//p' wgcf-profile.conf | tr -d ' \r\n')
-ADDRESS4=$(sed -n 's/^Address *= *\([0-9./]*\).*/\1/p' wgcf-profile.conf | head -1)
-
-# 验证密钥格式
-if [ ${#PRIVATE_KEY} -ne 44 ]; then
-    echo -e "${YELLOW}警告: 密钥长度异常 (${#PRIVATE_KEY})，尝试重新提取...${NC}"
-    # 备用提取方式
-    PRIVATE_KEY=$(awk -F' *= *' '/PrivateKey/{print $2}' wgcf-profile.conf | tr -d ' \r\n')
-fi
-
 echo -e "${GREEN}✓ WARP 账户已注册${NC}"
 
-# 生成配置文件 - 只让 Google IP 走 WARP
+# 生成配置文件 - 直接复制并修改
 echo -e "\n${CYAN}[4/4] 配置路由规则...${NC}"
+
+# 复制原始配置
+cp wgcf-profile.conf warp.conf
 
 # 构建 AllowedIPs (只包含 Google IP)
 ALLOWED_IPS=""
@@ -192,18 +184,20 @@ done
 # 移除最后的逗号和空格
 ALLOWED_IPS="${ALLOWED_IPS%, }"
 
-cat > /etc/wireguard/warp.conf << EOF
-[Interface]
-PrivateKey = $PRIVATE_KEY
-Address = $ADDRESS4
-MTU = 1280
+# 使用 sed 直接替换配置文件中的 AllowedIPs
+# 删除原有的 AllowedIPs 行，然后在 Endpoint 前插入新的
+sed -i '/^AllowedIPs/d' warp.conf
+sed -i "/^Endpoint/i AllowedIPs = $ALLOWED_IPS" warp.conf
 
-[Peer]
-PublicKey = bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=
-AllowedIPs = $ALLOWED_IPS
-Endpoint = engage.cloudflareclient.com:2408
-PersistentKeepalive = 25
-EOF
+# 添加 MTU 设置（如果不存在）
+if ! grep -q "^MTU" warp.conf; then
+    sed -i '/^\[Interface\]/a MTU = 1280' warp.conf
+fi
+
+# 添加 PersistentKeepalive（如果不存在）
+if ! grep -q "^PersistentKeepalive" warp.conf; then
+    echo "PersistentKeepalive = 25" >> warp.conf
+fi
 
 echo -e "${GREEN}✓ 路由规则已配置 (${#GOOGLE_IPS[@]} 个 Google IP 段)${NC}"
 
