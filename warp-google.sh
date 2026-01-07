@@ -1,7 +1,7 @@
 #!/bin/bash
 # ===================================================
-# Project: WARP Unlocker (Granular Control Edition)
-# Version: 7.0 (YouTube Separate & AppStore Included)
+# Project: WARP Unlocker (Universal Adaptive v8.0)
+# Version: 8.0 (Auto-Detect IPv4/IPv6 Dual Stack)
 # ===================================================
 
 RED='\033[0;31m'
@@ -14,33 +14,56 @@ NC='\033[0m'
 # 核心安装逻辑
 # ===================================================
 install_core() {
-    # MODE 1: Google Only (Gemini/Search/PlayStore) - No YouTube
-    # MODE 2: Google + YouTube
-    # MODE 3: Google + YouTube + Media (Netflix/Disney+)
     MODE=$1 
 
-    echo -e "${YELLOW}>>> [1/6] 初始化环境...${NC}"
-    check_env
+    echo -e "${YELLOW}>>> [1/7] 初始化与环境检测...${NC}"
+    check_root
+    check_tun
+    install_deps
     
-    # 清理动作
+    # === 智能检测 IPv6 能力 ===
+    # 检测逻辑：ping Google IPv6 DNS，通则认为有 IPv6 能力
+    HAS_IPV6=false
+    if ping6 -c 1 -W 2 2001:4860:4860::8888 >/dev/null 2>&1; then
+        HAS_IPV6=true
+        echo -e "环境检测: ${GREEN}双栈网络 (IPv4 + IPv6)${NC}"
+    else
+        echo -e "环境检测: ${YELLOW}单栈网络 (仅 IPv4)${NC}"
+    fi
+
+    # 清理旧环境
     systemctl stop wg-quick@warp >/dev/null 2>&1
     systemctl disable wg-quick@warp >/dev/null 2>&1
     ip link delete dev warp >/dev/null 2>&1
     rm -rf /etc/wireguard/warp.conf
     rm -rf /etc/wireguard/routes.txt
+    rm -rf /etc/wireguard/routes6.txt
 
-    install_deps
+    echo -e "${YELLOW}>>> [2/7] 获取 WARP 账户与密钥...${NC}"
+    get_warp_profile
 
-    echo -e "${YELLOW}>>> [2/6] 获取 WARP 密钥...${NC}"
-    get_warp_key
+    echo -e "${YELLOW}>>> [3/7] 生成自适应配置...${NC}"
+    
+    # 提取 wgcf 生成的原始参数
+    PRIVATE_KEY=$(grep 'PrivateKey' wgcf-profile.conf | cut -d' ' -f3)
+    # 提取原始 Address (通常包含 v4 和 v6)
+    ORIG_ADDR=$(grep 'Address' wgcf-profile.conf | cut -d'=' -f2 | tr -d ' ')
+    
+    # 根据检测结果处理 Address
+    if [ "$HAS_IPV6" = true ]; then
+        # 如果系统支持 IPv6，直接使用原始的双栈地址
+        FINAL_ADDR="$ORIG_ADDR"
+    else
+        # 如果系统不支持 IPv6，强制只截取逗号前的 IPv4 地址
+        FINAL_ADDR=$(echo "$ORIG_ADDR" | cut -d',' -f1)
+    fi
 
-    echo -e "${YELLOW}>>> [3/6] 写入纯净配置 (强制 IPv4)...${NC}"
-    # 核心配置不动，保证 RackNerd 稳定性
+    # 写入配置文件
     cat > /etc/wireguard/warp.conf <<WG_CONF
 [Interface]
 PrivateKey = $PRIVATE_KEY
-Address = 172.16.0.2/32
-DNS = 8.8.8.8, 1.1.1.1
+Address = $FINAL_ADDR
+DNS = 8.8.8.8, 1.1.1.1, 2001:4860:4860::8888
 MTU = 1280
 Table = off
 PostUp = bash /etc/wireguard/add_routes.sh
@@ -48,33 +71,37 @@ PreDown = bash /etc/wireguard/del_routes.sh
 
 [Peer]
 PublicKey = bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=
-AllowedIPs = 0.0.0.0/0
+AllowedIPs = 0.0.0.0/0, ::/0
 Endpoint = 162.159.192.1:2408
 PersistentKeepalive = 25
 WG_CONF
 
-    echo -e "${YELLOW}>>> [4/6] 下载分流规则 (模式: $MODE)...${NC}"
-    generate_routes "$MODE"
+    echo -e "${YELLOW}>>> [4/7] 下载分流规则 (模式: $MODE)...${NC}"
+    generate_routes "$MODE" "$HAS_IPV6"
 
-    echo -e "${YELLOW}>>> [5/6] 启动服务...${NC}"
-    # 开启转发
+    echo -e "${YELLOW}>>> [5/7] 启动服务...${NC}"
+    # 开启 IPv4/IPv6 转发
     echo "net.ipv4.ip_forward = 1" > /etc/sysctl.d/warp.conf
+    echo "net.ipv6.conf.all.forwarding = 1" >> /etc/sysctl.d/warp.conf
     sysctl -p /etc/sysctl.d/warp.conf >/dev/null 2>&1
 
     systemctl enable wg-quick@warp >/dev/null 2>&1
     systemctl start wg-quick@warp
 
-    echo -e "${YELLOW}>>> [6/6] 最终验证...${NC}"
+    echo -e "${YELLOW}>>> [6/7] 最终验证...${NC}"
     sleep 3
-    check_status
+    check_status "$HAS_IPV6"
 }
 
 # ===================================================
-# 辅助函数
+# 辅助函数模块
 # ===================================================
 
-check_env() {
+check_root() {
     [[ $EUID -ne 0 ]] && echo -e "${RED}错误：请使用 root 权限运行！${NC}" && exit 1
+}
+
+check_tun() {
     if [ ! -e /dev/net/tun ]; then
         mkdir -p /dev/net
         mknod /dev/net/tun c 10 200 >/dev/null 2>&1
@@ -91,7 +118,7 @@ install_deps() {
     fi
 }
 
-get_warp_key() {
+get_warp_profile() {
     mkdir -p /etc/wireguard/warp_tmp
     cd /etc/wireguard/warp_tmp || exit
     ARCH=$(uname -m)
@@ -99,74 +126,96 @@ get_warp_key() {
         WGCF_URL="https://github.com/ViRb3/wgcf/releases/download/v2.2.22/wgcf_2.2.22_linux_amd64"
     elif [[ $ARCH == "aarch64" ]]; then
         WGCF_URL="https://github.com/ViRb3/wgcf/releases/download/v2.2.22/wgcf_2.2.22_linux_arm64"
-    else
-        echo -e "${RED}不支持的架构${NC}" && exit 1
     fi
+    
     if [ ! -f /usr/local/bin/wgcf ]; then
         wget -qO /usr/local/bin/wgcf $WGCF_URL
         chmod +x /usr/local/bin/wgcf
     fi
+
     if [ ! -f wgcf-account.toml ]; then
         echo | /usr/local/bin/wgcf register >/dev/null 2>&1
     fi
     /usr/local/bin/wgcf generate >/dev/null 2>&1
-    PRIVATE_KEY=$(grep 'PrivateKey' wgcf-profile.conf | cut -d' ' -f3)
-    cd /root || exit
-    rm -rf /etc/wireguard/warp_tmp
-    if [ -z "$PRIVATE_KEY" ]; then
-        echo -e "${RED}❌ 密钥获取失败，请重试${NC}"
+    
+    if [ ! -f wgcf-profile.conf ]; then
+        echo -e "${RED}❌ WARP 配置文件生成失败，请检查网络连接${NC}"
         exit 1
     fi
+    
+    # 移动 profile 到临时目录供提取，但不删除，以便 debug
+    cp wgcf-profile.conf profile_backup.conf
 }
 
 generate_routes() {
     MODE=$1
+    IPV6_ENABLED=$2
+    
     cat > /etc/wireguard/add_routes.sh <<EOF
 #!/bin/bash
 IP_FILE="/etc/wireguard/routes.txt"
-rm -f \$IP_FILE
+IP6_FILE="/etc/wireguard/routes6.txt"
+rm -f \$IP_FILE \$IP6_FILE
 
-# === 规则源：Blackmatrix7 (更精准的分类) ===
-
-echo "正在下载 Google 基础规则 (Search/Gemini/PlayStore)..."
+# --- 下载 IPv4 规则 ---
 wget -qO- https://raw.githubusercontent.com/blackmatrix7/ios_rule_script/master/rule/Clash/Google/Google_IP-CIDR.txt >> \$IP_FILE
 
 if [ "$MODE" == "youtube" ] || [ "$MODE" == "media" ]; then
-    echo "正在下载 YouTube 规则..."
     wget -qO- https://raw.githubusercontent.com/blackmatrix7/ios_rule_script/master/rule/Clash/YouTube/YouTube_IP-CIDR.txt >> \$IP_FILE
 fi
 
 if [ "$MODE" == "media" ]; then
-    echo "正在下载 Netflix/Disney+/OpenAI 规则..."
     wget -qO- https://raw.githubusercontent.com/blackmatrix7/ios_rule_script/master/rule/Clash/Netflix/Netflix_IP-CIDR.txt >> \$IP_FILE
     wget -qO- https://raw.githubusercontent.com/blackmatrix7/ios_rule_script/master/rule/Clash/Disney/Disney_IP-CIDR.txt >> \$IP_FILE
     wget -qO- https://raw.githubusercontent.com/blackmatrix7/ios_rule_script/master/rule/Clash/OpenAI/OpenAI_IP-CIDR.txt >> \$IP_FILE
 fi
 
-# 兜底
-if [ ! -s \$IP_FILE ]; then
-    echo "142.250.0.0/15" > \$IP_FILE
-fi
+# 兜底 IPv4
+if [ ! -s \$IP_FILE ]; then echo "142.250.0.0/15" > \$IP_FILE; fi
 
-# 批量添加
+# --- 注入 IPv4 路由 ---
 while read ip; do
   [[ \$ip =~ ^# ]] && continue
   [[ -z \$ip ]] && continue
   clean_ip=\$(echo \$ip | awk '{print \$1}')
   ip route add \$clean_ip dev warp >/dev/null 2>&1
 done < \$IP_FILE
+
+# --- 处理 IPv6 (如果启用) ---
+if [ "$IPV6_ENABLED" = true ]; then
+    # 下载 Google IPv6 列表 (Blackmatrix7 源通常包含混合内容，需筛选)
+    # 这里为了稳妥，直接使用 Google 官方 IPv6 段或专门列表
+    # 暂时使用一个通用的 Google IPv6 列表
+    echo "2001:4860::/32" > \$IP6_FILE
+    echo "2404:6800::/32" >> \$IP6_FILE
+    
+    while read ip; do
+      ip -6 route add \$ip dev warp >/dev/null 2>&1
+    done < \$IP6_FILE
+fi
 EOF
 
     cat > /etc/wireguard/del_routes.sh <<EOF
 #!/bin/bash
 IP_FILE="/etc/wireguard/routes.txt"
-[ ! -f "\$IP_FILE" ] && exit 0
-while read ip; do
-  [[ \$ip =~ ^# ]] && continue
-  [[ -z \$ip ]] && continue
-  clean_ip=\$(echo \$ip | awk '{print \$1}')
-  ip route del \$clean_ip dev warp >/dev/null 2>&1
-done < \$IP_FILE
+IP6_FILE="/etc/wireguard/routes6.txt"
+
+# 删除 IPv4
+if [ -f "\$IP_FILE" ]; then
+    while read ip; do
+      [[ \$ip =~ ^# ]] && continue
+      [[ -z \$ip ]] && continue
+      clean_ip=\$(echo \$ip | awk '{print \$1}')
+      ip route del \$clean_ip dev warp >/dev/null 2>&1
+    done < \$IP_FILE
+fi
+
+# 删除 IPv6
+if [ -f "\$IP6_FILE" ]; then
+    while read ip; do
+      ip -6 route del \$ip dev warp >/dev/null 2>&1
+    done < \$IP6_FILE
+fi
 EOF
     chmod +x /etc/wireguard/*.sh
 }
@@ -182,17 +231,19 @@ uninstall_warp() {
     rm -rf /etc/wireguard/warp.conf
     rm -rf /etc/wireguard/*.sh
     rm -rf /etc/wireguard/routes.txt
+    rm -rf /etc/wireguard/routes6.txt
+    rm -rf /etc/wireguard/warp_tmp
     rm -f /usr/local/bin/wgcf
     echo -e "${GREEN}>>> 卸载完成。${NC}"
 }
 
 check_status() {
-    # 服务检测
+    HAS_IPV6=$1
     if ! systemctl is-active --quiet wg-quick@warp; then
         echo -e "服务状态: ${RED}未运行${NC}"
         return
     fi
-    # 握手检测
+    
     HANDSHAKE=$(wg show warp latest-handshakes | awk '{print $2}')
     if [ -z "$HANDSHAKE" ] || [ "$HANDSHAKE" == "0" ]; then
         echo -e "${RED}⚠️  握手失败 (Handshake=0)，请检查防火墙。${NC}"
@@ -202,24 +253,22 @@ check_status() {
     fi
 
     echo -e "--- 分流效果测试 ---"
-    # Google/Gemini
-    G_CODE=$(curl -sI -4 -o /dev/null -w "%{http_code}" https://gemini.google.com --max-time 5)
-    if [[ "$G_CODE" =~ ^(200|301|302)$ ]]; then
-        echo -e "Gemini/商店: ${GREEN}✅ 已解锁 (WARP)${NC}"
+    # 强制 IPv4 测试
+    G4_CODE=$(curl -sI -4 -o /dev/null -w "%{http_code}" https://gemini.google.com --max-time 5)
+    if [[ "$G4_CODE" =~ ^(200|301|302)$ ]]; then
+        echo -e "Gemini (IPv4): ${GREEN}✅ 已解锁${NC}"
     else
-        echo -e "Gemini/商店: ${RED}❌ 失败 ($G_CODE)${NC}"
+        echo -e "Gemini (IPv4): ${RED}❌ 失败 ($G4_CODE)${NC}"
     fi
 
-    # YouTube 检测 (判断是否直连)
-    # 我们没法直接检测“是否有广告”，但可以检测 IP 归属。
-    # 如果没把 YouTube 加入规则，这里显示的应该是 VPS 原生 IP 归属地。
-    
-    # Netflix 检测
-    N_CODE=$(curl -sI -4 -o /dev/null -w "%{http_code}" https://www.netflix.com --max-time 5)
-    if [[ "$N_CODE" =~ ^(200|301|302)$ ]]; then
-        echo -e "Netflix连接: ${GREEN}✅ 畅通${NC}"
-    else
-        echo -e "Netflix连接: ${YELLOW}⚠️  直连/未解锁${NC}"
+    # 如果有 IPv6，测试 IPv6 分流
+    if [ "$HAS_IPV6" = true ]; then
+        G6_CODE=$(curl -sI -6 -o /dev/null -w "%{http_code}" https://gemini.google.com --max-time 5)
+        if [[ "$G6_CODE" =~ ^(200|301|302)$ ]]; then
+            echo -e "Gemini (IPv6): ${GREEN}✅ 已解锁${NC}"
+        else
+            echo -e "Gemini (IPv6): ${RED}❌ 失败 (可能路由未生效或WARP v6节点问题)${NC}"
+        fi
     fi
 }
 
@@ -228,13 +277,13 @@ check_status() {
 # ===================================================
 clear
 echo -e "${GREEN}=============================================${NC}"
-echo -e "${GREEN}    WARP Unlocker (Granular Control v7.0)    ${NC}"
+echo -e "${GREEN}   WARP Unlocker (Universal v8.0)            ${NC}"
 echo -e "${GREEN}=============================================${NC}"
-echo -e "${YELLOW}说明：保留 YouTube 直连可享受送中 IP 无广告福利。${NC}"
+echo -e "${YELLOW}自动识别 IPv4/IPv6 双栈环境${NC}"
 echo -e "---------------------------------------------"
-echo -e "1. 解锁 Google基础 (Gemini/搜索/商店) - ${SKYBLUE}YouTube 直连(无广告)${NC}"
-echo -e "2. 解锁 Google全家桶 (含 YouTube)     - ${SKYBLUE}YouTube 走 WARP${NC}"
-echo -e "3. 解锁 媒体全家桶 (含 YouTube/Netflix) - ${SKYBLUE}全部走 WARP${NC}"
+echo -e "1. 解锁 Google基础 (Gemini/搜索) - ${SKYBLUE}YouTube 直连(无广告)${NC}"
+echo -e "2. 解锁 Google全家桶 (含 YouTube) - ${SKYBLUE}YouTube 走 WARP${NC}"
+echo -e "3. 解锁 媒体全家桶 (含 YouTube/Netflix)"
 echo -e "---------------------------------------------"
 echo -e "4. 卸载 (Uninstall)"
 echo -e "5. 检测状态 (Check Status)"
@@ -247,7 +296,7 @@ case $choice in
     2) install_core "youtube" ;;
     3) install_core "media" ;;
     4) uninstall_warp ;;
-    5) check_status ;;
+    5) check_status "false" ;; # 菜单检测默认不传入v6参数，仅做基础检查
     0) exit 0 ;;
     *) echo "无效选择" ;;
 esac
