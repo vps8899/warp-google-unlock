@@ -1,7 +1,7 @@
 #!/bin/bash
 # ===================================================
-# Project: WARP Unlocker (Universal Adaptive v8.0)
-# Version: 8.0 (Auto-Detect IPv4/IPv6 Dual Stack)
+# Project: WARP Unlocker (Smart Fallback v8.1)
+# Version: 8.1 (Auto-Downgrade if IPv6 Fails)
 # ===================================================
 
 RED='\033[0;31m'
@@ -21,8 +21,7 @@ install_core() {
     check_tun
     install_deps
     
-    # === 智能检测 IPv6 能力 ===
-    # 检测逻辑：ping Google IPv6 DNS，通则认为有 IPv6 能力
+    # 1. 初步检测 IPv6 (RackNerd 可能会在这里骗过检测)
     HAS_IPV6=false
     if ping6 -c 1 -W 2 2001:4860:4860::8888 >/dev/null 2>&1; then
         HAS_IPV6=true
@@ -42,28 +41,79 @@ install_core() {
     echo -e "${YELLOW}>>> [2/7] 获取 WARP 账户与密钥...${NC}"
     get_warp_profile
 
-    echo -e "${YELLOW}>>> [3/7] 生成自适应配置...${NC}"
+    echo -e "${YELLOW}>>> [3/7] 生成初始配置...${NC}"
     
-    # 提取 wgcf 生成的原始参数
     PRIVATE_KEY=$(grep 'PrivateKey' wgcf-profile.conf | cut -d' ' -f3)
-    # 提取原始 Address (通常包含 v4 和 v6)
     ORIG_ADDR=$(grep 'Address' wgcf-profile.conf | cut -d'=' -f2 | tr -d ' ')
     
-    # 根据检测结果处理 Address
+    # 根据检测结果决定初始 Address
     if [ "$HAS_IPV6" = true ]; then
-        # 如果系统支持 IPv6，直接使用原始的双栈地址
         FINAL_ADDR="$ORIG_ADDR"
+        DNS_STR="8.8.8.8, 1.1.1.1, 2001:4860:4860::8888"
+        ALLOWED_IPS="0.0.0.0/0, ::/0"
     else
-        # 如果系统不支持 IPv6，强制只截取逗号前的 IPv4 地址
         FINAL_ADDR=$(echo "$ORIG_ADDR" | cut -d',' -f1)
+        DNS_STR="8.8.8.8, 1.1.1.1"
+        ALLOWED_IPS="0.0.0.0/0"
     fi
 
-    # 写入配置文件
+    write_conf "$PRIVATE_KEY" "$FINAL_ADDR" "$DNS_STR" "$ALLOWED_IPS"
+
+    echo -e "${YELLOW}>>> [4/7] 下载分流规则 (模式: $MODE)...${NC}"
+    generate_routes "$MODE" "$HAS_IPV6"
+
+    echo -e "${YELLOW}>>> [5/7] 首次启动服务...${NC}"
+    # 开启转发
+    echo "net.ipv4.ip_forward = 1" > /etc/sysctl.d/warp.conf
+    echo "net.ipv6.conf.all.forwarding = 1" >> /etc/sysctl.d/warp.conf
+    sysctl -p /etc/sysctl.d/warp.conf >/dev/null 2>&1
+
+    systemctl enable wg-quick@warp >/dev/null 2>&1
+    if systemctl start wg-quick@warp; then
+        echo -e "${GREEN}>>> 启动成功！${NC}"
+        FINAL_IPV6_STATUS=$HAS_IPV6
+    else
+        # === 核心修复逻辑：自动降级 ===
+        echo -e "${RED}>>> 启动失败！检测到可能的 IPv6 兼容性问题 (RackNerd Trap)。${NC}"
+        echo -e "${YELLOW}>>> 正在触发自动降级机制：强制切换为纯 IPv4 模式重试...${NC}"
+        
+        # 1. 强制只取 IPv4 地址
+        IPV4_ONLY_ADDR=$(echo "$ORIG_ADDR" | cut -d',' -f1)
+        # 2. 重写配置文件
+        write_conf "$PRIVATE_KEY" "$IPV4_ONLY_ADDR" "8.8.8.8, 1.1.1.1" "0.0.0.0/0"
+        # 3. 重新生成路由 (强制 disable IPv6)
+        generate_routes "$MODE" "false"
+        
+        # 4. 重试启动
+        if systemctl restart wg-quick@warp; then
+            echo -e "${GREEN}>>> 降级重试成功！已切换为纯 IPv4 模式。${NC}"
+            FINAL_IPV6_STATUS="false"
+        else
+            echo -e "${RED}>>> 严重错误：纯 IPv4 模式也无法启动。请检查系统日志。${NC}"
+            exit 1
+        fi
+    fi
+
+    echo -e "${YELLOW}>>> [6/7] 最终验证...${NC}"
+    sleep 3
+    check_status "$FINAL_IPV6_STATUS"
+}
+
+# ===================================================
+# 辅助函数模块
+# ===================================================
+
+write_conf() {
+    local key=$1
+    local addr=$2
+    local dns=$3
+    local allowed=$4
+    
     cat > /etc/wireguard/warp.conf <<WG_CONF
 [Interface]
-PrivateKey = $PRIVATE_KEY
-Address = $FINAL_ADDR
-DNS = 8.8.8.8, 1.1.1.1, 2001:4860:4860::8888
+PrivateKey = $key
+Address = $addr
+DNS = $dns
 MTU = 1280
 Table = off
 PostUp = bash /etc/wireguard/add_routes.sh
@@ -71,31 +121,11 @@ PreDown = bash /etc/wireguard/del_routes.sh
 
 [Peer]
 PublicKey = bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=
-AllowedIPs = 0.0.0.0/0, ::/0
+AllowedIPs = $allowed
 Endpoint = 162.159.192.1:2408
 PersistentKeepalive = 25
 WG_CONF
-
-    echo -e "${YELLOW}>>> [4/7] 下载分流规则 (模式: $MODE)...${NC}"
-    generate_routes "$MODE" "$HAS_IPV6"
-
-    echo -e "${YELLOW}>>> [5/7] 启动服务...${NC}"
-    # 开启 IPv4/IPv6 转发
-    echo "net.ipv4.ip_forward = 1" > /etc/sysctl.d/warp.conf
-    echo "net.ipv6.conf.all.forwarding = 1" >> /etc/sysctl.d/warp.conf
-    sysctl -p /etc/sysctl.d/warp.conf >/dev/null 2>&1
-
-    systemctl enable wg-quick@warp >/dev/null 2>&1
-    systemctl start wg-quick@warp
-
-    echo -e "${YELLOW}>>> [6/7] 最终验证...${NC}"
-    sleep 3
-    check_status "$HAS_IPV6"
 }
-
-# ===================================================
-# 辅助函数模块
-# ===================================================
 
 check_root() {
     [[ $EUID -ne 0 ]] && echo -e "${RED}错误：请使用 root 权限运行！${NC}" && exit 1
@@ -142,8 +172,6 @@ get_warp_profile() {
         echo -e "${RED}❌ WARP 配置文件生成失败，请检查网络连接${NC}"
         exit 1
     fi
-    
-    # 移动 profile 到临时目录供提取，但不删除，以便 debug
     cp wgcf-profile.conf profile_backup.conf
 }
 
@@ -157,7 +185,6 @@ IP_FILE="/etc/wireguard/routes.txt"
 IP6_FILE="/etc/wireguard/routes6.txt"
 rm -f \$IP_FILE \$IP6_FILE
 
-# --- 下载 IPv4 规则 ---
 wget -qO- https://raw.githubusercontent.com/blackmatrix7/ios_rule_script/master/rule/Clash/Google/Google_IP-CIDR.txt >> \$IP_FILE
 
 if [ "$MODE" == "youtube" ] || [ "$MODE" == "media" ]; then
@@ -170,10 +197,8 @@ if [ "$MODE" == "media" ]; then
     wget -qO- https://raw.githubusercontent.com/blackmatrix7/ios_rule_script/master/rule/Clash/OpenAI/OpenAI_IP-CIDR.txt >> \$IP_FILE
 fi
 
-# 兜底 IPv4
 if [ ! -s \$IP_FILE ]; then echo "142.250.0.0/15" > \$IP_FILE; fi
 
-# --- 注入 IPv4 路由 ---
 while read ip; do
   [[ \$ip =~ ^# ]] && continue
   [[ -z \$ip ]] && continue
@@ -181,14 +206,9 @@ while read ip; do
   ip route add \$clean_ip dev warp >/dev/null 2>&1
 done < \$IP_FILE
 
-# --- 处理 IPv6 (如果启用) ---
 if [ "$IPV6_ENABLED" = true ]; then
-    # 下载 Google IPv6 列表 (Blackmatrix7 源通常包含混合内容，需筛选)
-    # 这里为了稳妥，直接使用 Google 官方 IPv6 段或专门列表
-    # 暂时使用一个通用的 Google IPv6 列表
     echo "2001:4860::/32" > \$IP6_FILE
     echo "2404:6800::/32" >> \$IP6_FILE
-    
     while read ip; do
       ip -6 route add \$ip dev warp >/dev/null 2>&1
     done < \$IP6_FILE
@@ -200,7 +220,6 @@ EOF
 IP_FILE="/etc/wireguard/routes.txt"
 IP6_FILE="/etc/wireguard/routes6.txt"
 
-# 删除 IPv4
 if [ -f "\$IP_FILE" ]; then
     while read ip; do
       [[ \$ip =~ ^# ]] && continue
@@ -210,7 +229,6 @@ if [ -f "\$IP_FILE" ]; then
     done < \$IP_FILE
 fi
 
-# 删除 IPv6
 if [ -f "\$IP6_FILE" ]; then
     while read ip; do
       ip -6 route del \$ip dev warp >/dev/null 2>&1
@@ -246,14 +264,13 @@ check_status() {
     
     HANDSHAKE=$(wg show warp latest-handshakes | awk '{print $2}')
     if [ -z "$HANDSHAKE" ] || [ "$HANDSHAKE" == "0" ]; then
-        echo -e "${RED}⚠️  握手失败 (Handshake=0)，请检查防火墙。${NC}"
+        echo -e "${RED}⚠️  握手失败 (Handshake=0)${NC}"
         return
     else
-        echo -e "WARP 握手: ${GREEN}正常${NC}"
+        echo -e "WARP 握手: ${GREEN}正常 (Mode: $([ "$HAS_IPV6" = true ] && echo "IPv4+IPv6" || echo "IPv4-Only"))${NC}"
     fi
 
     echo -e "--- 分流效果测试 ---"
-    # 强制 IPv4 测试
     G4_CODE=$(curl -sI -4 -o /dev/null -w "%{http_code}" https://gemini.google.com --max-time 5)
     if [[ "$G4_CODE" =~ ^(200|301|302)$ ]]; then
         echo -e "Gemini (IPv4): ${GREEN}✅ 已解锁${NC}"
@@ -261,13 +278,12 @@ check_status() {
         echo -e "Gemini (IPv4): ${RED}❌ 失败 ($G4_CODE)${NC}"
     fi
 
-    # 如果有 IPv6，测试 IPv6 分流
     if [ "$HAS_IPV6" = true ]; then
         G6_CODE=$(curl -sI -6 -o /dev/null -w "%{http_code}" https://gemini.google.com --max-time 5)
         if [[ "$G6_CODE" =~ ^(200|301|302)$ ]]; then
             echo -e "Gemini (IPv6): ${GREEN}✅ 已解锁${NC}"
         else
-            echo -e "Gemini (IPv6): ${RED}❌ 失败 (可能路由未生效或WARP v6节点问题)${NC}"
+            echo -e "Gemini (IPv6): ${RED}❌ 失败 (IPv6不可用)${NC}"
         fi
     fi
 }
@@ -277,9 +293,9 @@ check_status() {
 # ===================================================
 clear
 echo -e "${GREEN}=============================================${NC}"
-echo -e "${GREEN}   WARP Unlocker (Universal v8.0)            ${NC}"
+echo -e "${GREEN}   WARP Unlocker (Smart Fallback v8.1)       ${NC}"
 echo -e "${GREEN}=============================================${NC}"
-echo -e "${YELLOW}自动识别 IPv4/IPv6 双栈环境${NC}"
+echo -e "${YELLOW}自动检测双栈 -> 失败自动降级 IPv4${NC}"
 echo -e "---------------------------------------------"
 echo -e "1. 解锁 Google基础 (Gemini/搜索) - ${SKYBLUE}YouTube 直连(无广告)${NC}"
 echo -e "2. 解锁 Google全家桶 (含 YouTube) - ${SKYBLUE}YouTube 走 WARP${NC}"
@@ -296,7 +312,7 @@ case $choice in
     2) install_core "youtube" ;;
     3) install_core "media" ;;
     4) uninstall_warp ;;
-    5) check_status "false" ;; # 菜单检测默认不传入v6参数，仅做基础检查
+    5) check_status "false" ;; 
     0) exit 0 ;;
     *) echo "无效选择" ;;
 esac
