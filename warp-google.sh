@@ -228,7 +228,8 @@ setup_warp_profile() {
     local IPV4_ADDR="172.16.0.2"
 
     local IPV6_ADDR
-    IPV6_ADDR=$(echo "$RESPONSE" | grep -oP '"addresses"\s*:\s*\{[^}]*"v6"\s*:\s*"\K[0-9a-fA-F:]+' | head -n 1)
+    IPV6_ADDR=$(python3 -c "import sys, json; print(json.loads(sys.stdin.read()).get('config',{}).get('interface',{}).get('addresses',{}).get('v6',''))" <<< "$RESPONSE" 2>/dev/null)
+    [ -z "$IPV6_ADDR" ] && IPV6_ADDR=$(echo "$RESPONSE" | grep -oP '"addresses"\s*:\s*\{[^}]*"v6"\s*:\s*"\K[0-9a-fA-F:]+' | head -n 1)
     IPV6_ADDR=${IPV6_ADDR:-2606:4700:110:8827:18b5:2de8:8b53:96e3}
 
     local PEER_PUBKEY
@@ -254,7 +255,6 @@ setup_warp_profile() {
     fi
 
     # 终极修复: 激活 Cloudflare WARP 官方账号授权 (warp_enabled: true)
-    # 彻底解决新注册设备默认处于关闭状态导致握手被服务器静默丢弃 (0 B received) 的问题！
     local DEV_ID
     DEV_ID=$(echo "$RESPONSE" | grep -oP '"id"\s*:\s*"\K[^"]+' | head -n 1)
     local TOKEN
@@ -271,17 +271,16 @@ setup_warp_profile() {
         fi
     fi
 
-    # 不添加 DNS 避免触发 resolvconf 权限冲突，显式设置 MTU=1280 杜绝握手大包分片黑洞
-    # PostUp 绑定网卡生命周期，确保无论何时重启网卡，路由表 51820 与 MASQUERADE 规则永不丢失
-    # 配置文件采用官方标准 WireGuard 规范 (移除一切导致 Line unrecognized 的非标参数)
+    # 显式设置 MTU=1200 杜绝大包分片断网，Keepalive=10 彻底稳固 NAT 映射
+    # PostUp 绑定 IPv4 与 IPv6 策略路由与 MASQUERADE 规则，保证 IPv6 纯美区直通
     cat > /etc/wireguard/warp0.conf << EOF
 [Interface]
 PrivateKey = $PRIVKEY
-Address = ${IPV4_ADDR}/32, ${IPV6_ADDR:-2606:4700:110:8::1}/128
+Address = ${IPV4_ADDR}/32, ${IPV6_ADDR}/128
 MTU = 1200
 Table = off
-PostUp = ip rule add fwmark 51820 lookup 51820 priority 100 2>/dev/null || true; ip route replace default dev warp0 table 51820; iptables -t nat -D POSTROUTING -o warp0 -j MASQUERADE 2>/dev/null || true; iptables -t nat -A POSTROUTING -o warp0 -j MASQUERADE; iptables -t mangle -D POSTROUTING -p tcp --tcp-flags SYN,RST SYN -o warp0 -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true; iptables -t mangle -A POSTROUTING -p tcp --tcp-flags SYN,RST SYN -o warp0 -j TCPMSS --clamp-mss-to-pmtu
-PostDown = ip route flush table 51820 2>/dev/null || true
+PostUp = ip rule add fwmark 51820 lookup 51820 priority 100 2>/dev/null || true; ip route replace default dev warp0 table 51820; iptables -t nat -D POSTROUTING -o warp0 -j MASQUERADE 2>/dev/null || true; iptables -t nat -A POSTROUTING -o warp0 -j MASQUERADE; iptables -t mangle -D POSTROUTING -p tcp --tcp-flags SYN,RST SYN -o warp0 -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true; iptables -t mangle -A POSTROUTING -p tcp --tcp-flags SYN,RST SYN -o warp0 -j TCPMSS --clamp-mss-to-pmtu; ip -6 rule add fwmark 51820 lookup 51820 priority 100 2>/dev/null || true; ip -6 route replace default dev warp0 table 51820 2>/dev/null || true; ip6tables -t nat -D POSTROUTING -o warp0 -j MASQUERADE 2>/dev/null || true; ip6tables -t nat -A POSTROUTING -o warp0 -j MASQUERADE 2>/dev/null || true
+PostDown = ip route flush table 51820 2>/dev/null || true; ip -6 route flush table 51820 2>/dev/null || true
 
 [Peer]
 PublicKey = ${PEER_PUBKEY:-bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=}
@@ -311,56 +310,56 @@ no-resolv
 clear-on-reload
 
 # ----------------- 1. Google 搜索与核心基础服务 -----------------
-ipset=/google.com/warp_unlock
-ipset=/google.co.jp/warp_unlock
-ipset=/google.com.hk/warp_unlock
-ipset=/google.com.tw/warp_unlock
-ipset=/google.cn/warp_unlock
-ipset=/googleapis.com/warp_unlock
-ipset=/googleusercontent.com/warp_unlock
-ipset=/gstatic.com/warp_unlock
-ipset=/1e100.net/warp_unlock
-ipset=/google-analytics.com/warp_unlock
-ipset=/googletagmanager.com/warp_unlock
-ipset=/goo.gl/warp_unlock
-ipset=/google.dev/warp_unlock
-ipset=/web.dev/warp_unlock
-ipset=/chrome.com/warp_unlock
+ipset=/google.com/warp_unlock,warp_unlock6
+ipset=/google.co.jp/warp_unlock,warp_unlock6
+ipset=/google.com.hk/warp_unlock,warp_unlock6
+ipset=/google.com.tw/warp_unlock,warp_unlock6
+ipset=/google.cn/warp_unlock,warp_unlock6
+ipset=/googleapis.com/warp_unlock,warp_unlock6
+ipset=/googleusercontent.com/warp_unlock,warp_unlock6
+ipset=/gstatic.com/warp_unlock,warp_unlock6
+ipset=/1e100.net/warp_unlock,warp_unlock6
+ipset=/google-analytics.com/warp_unlock,warp_unlock6
+ipset=/googletagmanager.com/warp_unlock,warp_unlock6
+ipset=/goo.gl/warp_unlock,warp_unlock6
+ipset=/google.dev/warp_unlock,warp_unlock6
+ipset=/web.dev/warp_unlock,warp_unlock6
+ipset=/chrome.com/warp_unlock,warp_unlock6
 
 # ----------------- 2. YouTube 全系列 (解决 YouTube 送中 / Premium 中国区限制) -----------------
-ipset=/youtube.com/warp_unlock
-ipset=/youtu.be/warp_unlock
-ipset=/ytimg.com/warp_unlock
-ipset=/googlevideo.com/warp_unlock
-ipset=/yt.be/warp_unlock
+ipset=/youtube.com/warp_unlock,warp_unlock6
+ipset=/youtu.be/warp_unlock,warp_unlock6
+ipset=/ytimg.com/warp_unlock,warp_unlock6
+ipset=/googlevideo.com/warp_unlock,warp_unlock6
+ipset=/yt.be/warp_unlock,warp_unlock6
 
 # ----------------- 3. Google Play 商店 & 安卓生态核心 CDN -----------------
-ipset=/android.com/warp_unlock
-ipset=/googleplay.com/warp_unlock
-ipset=/gvt1.com/warp_unlock
-ipset=/gvt2.com/warp_unlock
-ipset=/gvt3.com/warp_unlock
-ipset=/ggpht.com/warp_unlock
-ipset=/app-measurement.com/warp_unlock
+ipset=/android.com/warp_unlock,warp_unlock6
+ipset=/googleplay.com/warp_unlock,warp_unlock6
+ipset=/gvt1.com/warp_unlock,warp_unlock6
+ipset=/gvt2.com/warp_unlock,warp_unlock6
+ipset=/gvt3.com/warp_unlock,warp_unlock6
+ipset=/ggpht.com/warp_unlock,warp_unlock6
+ipset=/app-measurement.com/warp_unlock,warp_unlock6
 
 # ----------------- 4. Google AI 全矩阵 (Gemini / Antigravity / AI Studio / NotebookLM) -----------------
-ipset=/gemini.google.com/warp_unlock
-ipset=/antigravity.google/warp_unlock
-ipset=/aistudio.google.com/warp_unlock
-ipset=/bard.google.com/warp_unlock
-ipset=/deepmind.com/warp_unlock
-ipset=/deepmind.google/warp_unlock
-ipset=/notebooklm.google/warp_unlock
-ipset=/generativeai.google/warp_unlock
+ipset=/gemini.google.com/warp_unlock,warp_unlock6
+ipset=/antigravity.google/warp_unlock,warp_unlock6
+ipset=/aistudio.google.com/warp_unlock,warp_unlock6
+ipset=/bard.google.com/warp_unlock,warp_unlock6
+ipset=/deepmind.com/warp_unlock,warp_unlock6
+ipset=/deepmind.google/warp_unlock,warp_unlock6
+ipset=/notebooklm.google/warp_unlock,warp_unlock6
+ipset=/generativeai.google/warp_unlock,warp_unlock6
 
 # ----------------- 5. OpenAI / ChatGPT & Claude 全系列 -----------------
-ipset=/openai.com/warp_unlock
-ipset=/chatgpt.com/warp_unlock
-ipset=/oaistatic.com/warp_unlock
-ipset=/oaiusercontent.com/warp_unlock
-ipset=/auth0.openai.com/warp_unlock
-ipset=/claude.ai/warp_unlock
-ipset=/anthropic.com/warp_unlock
+ipset=/openai.com/warp_unlock,warp_unlock6
+ipset=/chatgpt.com/warp_unlock,warp_unlock6
+ipset=/oaistatic.com/warp_unlock,warp_unlock6
+ipset=/oaiusercontent.com/warp_unlock,warp_unlock6
+ipset=/auth0.openai.com/warp_unlock,warp_unlock6
+ipset=/claude.ai/warp_unlock,warp_unlock6
+ipset=/anthropic.com/warp_unlock,warp_unlock6
 EOF
 
     # 彻底停用 systemd-resolved 释放 53 端口，杜绝 Dnsmasq 启动失败
@@ -410,22 +409,29 @@ setup_routing_rules() {
 
     cat > /usr/local/bin/warp-route-apply.sh << 'EOF'
 #!/bin/bash
-# 0. 开启内核转发与优化反向路径过滤 (避免策略路由回包被内核阻断)
+# 0. 开启内核转发与优化反向路径过滤，解除 IPv6 禁用
 sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1
-sysctl -w net.ipv4.conf.all.rp_filter=2 >/dev/null 2>&1
-sysctl -w net.ipv4.conf.default.rp_filter=2 >/dev/null 2>&1
+sysctl -w net.ipv6.conf.all.disable_ipv6=0 >/dev/null 2>&1
+sysctl -w net.ipv6.conf.default.disable_ipv6=0 >/dev/null 2>&1
+sysctl -w net.ipv6.conf.all.forwarding=1 >/dev/null 2>&1
 
-# 1. 创建 ipset 集合 (升级为 hash:net，支持单个 IP 与 CIDR 网段，86400秒超时)
+# 1. 创建 ipset 集合 (IPv4 与 IPv6 双栈集合，86400秒超时)
 ipset create warp_unlock hash:net timeout 86400 -exist
+ipset create warp_unlock6 hash:net family inet6 timeout 86400 -exist
 
 # 预置 Google 全球核心骨干网段 (双重保险，零延迟防遗漏)
 for net in 142.250.0.0/15 172.217.0.0/16 216.58.192.0/19 173.194.0.0/16 74.125.0.0/16 64.233.160.0/19 66.102.0.0/20 66.249.64.0/19 108.177.0.0/17; do
     ipset add warp_unlock "$net" -exist 2>/dev/null || true
 done
+for net6 in 2607:f8b0::/32 2a00:1450::/32 2800:3f0::/32 2404:6800::/32; do
+    ipset add warp_unlock6 "$net6" -exist 2>/dev/null || true
+done
 
-# 2. 创建专用路由表 51820
+# 2. 创建专用路由表 51820 (IPv4 & IPv6 双栈)
 ip rule del fwmark 51820 lookup 51820 2>/dev/null || true
 ip rule add fwmark 51820 lookup 51820 priority 100
+ip -6 rule del fwmark 51820 lookup 51820 2>/dev/null || true
+ip -6 rule add fwmark 51820 lookup 51820 priority 100 2>/dev/null || true
 
 # 3. 启动 WireGuard 虚拟网卡并进行握手建立
 wg-quick down warp0 >/dev/null 2>&1 || true
@@ -463,23 +469,32 @@ sysctl -w net.ipv4.conf.all.rp_filter=0 >/dev/null 2>&1
 sysctl -w net.ipv4.conf.default.rp_filter=0 >/dev/null 2>&1
 [ -d /proc/sys/net/ipv4/conf/warp0 ] && sysctl -w net.ipv4.conf.warp0.rp_filter=0 >/dev/null 2>&1
 
-# 4. 确保 51820 路由表的默认网关为 warp0 虚拟接口
+# 4. 确保 51820 路由表的默认网关为 warp0 虚拟接口 (双栈)
 ip route flush table 51820 2>/dev/null || true
 ip route replace default dev warp0 table 51820
+ip -6 route flush table 51820 2>/dev/null || true
+ip -6 route replace default dev warp0 table 51820 2>/dev/null || true
 
-# 5. iptables 标记匹配 ipset 的流量 (OUTPUT 为代理服务端发起的出站)
+# 5. iptables / ip6tables 标记匹配 ipset 的流量 (OUTPUT 为代理服务端发起的出站)
 iptables -t mangle -D OUTPUT -m set --match-set warp_unlock dst -j MARK --set-mark 51820 2>/dev/null || true
 iptables -t mangle -A OUTPUT -m set --match-set warp_unlock dst -j MARK --set-mark 51820
 iptables -t mangle -D PREROUTING -m set --match-set warp_unlock dst -j MARK --set-mark 51820 2>/dev/null || true
 iptables -t mangle -A PREROUTING -m set --match-set warp_unlock dst -j MARK --set-mark 51820
 
+ip6tables -t mangle -D OUTPUT -m set --match-set warp_unlock6 dst -j MARK --set-mark 51820 2>/dev/null || true
+ip6tables -t mangle -A OUTPUT -m set --match-set warp_unlock6 dst -j MARK --set-mark 51820 2>/dev/null || true
+ip6tables -t mangle -D PREROUTING -m set --match-set warp_unlock6 dst -j MARK --set-mark 51820 2>/dev/null || true
+ip6tables -t mangle -A PREROUTING -m set --match-set warp_unlock6 dst -j MARK --set-mark 51820 2>/dev/null || true
+
 # 6. TCP MSS 钳制 (核心修复: 解决 HTTPS / TLS Client Hello 大包导致 ERR_CONNECTION_CLOSED)
 iptables -t mangle -D POSTROUTING -p tcp --tcp-flags SYN,RST SYN -o warp0 -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true
 iptables -t mangle -A POSTROUTING -p tcp --tcp-flags SYN,RST SYN -o warp0 -j TCPMSS --clamp-mss-to-pmtu
 
-# 7. NAT MASQUERADE (最核心修复: 为 warp0 出口流量执行源地址伪装，避免源 IP 错误被丢弃)
+# 7. NAT MASQUERADE (双栈源地址伪装，避免源 IP 错误被丢弃)
 iptables -t nat -D POSTROUTING -o warp0 -j MASQUERADE 2>/dev/null || true
 iptables -t nat -A POSTROUTING -o warp0 -j MASQUERADE
+ip6tables -t nat -D POSTROUTING -o warp0 -j MASQUERADE 2>/dev/null || true
+ip6tables -t nat -A POSTROUTING -o warp0 -j MASQUERADE 2>/dev/null || true
 
 # 8. 强制拦截 QUIC (UDP 443)，促使 Chrome/Edge 浏览器瞬间回落至极速稳定的 TCP (TLS 1.3)
 iptables -t filter -D FORWARD -p udp --dport 443 -m set --match-set warp_unlock dst -j REJECT --reject-with icmp-port-unreachable 2>/dev/null || true
@@ -529,26 +544,26 @@ ensure_clean_warp_region() {
         local CF_LOC
         CF_LOC=$(echo "$TRACE_INFO" | grep "^loc=" | cut -d= -f2)
 
-        # 2. 探测当前 WARP 出口的 YouTube 归属
+        # 2. 探测当前 WARP 出口的 YouTube 归属 (自适应双栈)
         local YT_TEST
-        YT_TEST=$(curl -sSL -4 --interface warp0 --max-time 6 \
+        YT_TEST=$(curl -sSL --interface warp0 --max-time 6 \
             -H "Accept-Language: en" \
             -b "YSC=BiCUU3-5Gdk; CONSENT=YES+cb.20220301-11-p0.en+FX+700; GPS=1; VISITOR_INFO1_LIVE=4VwPMkB7W5A; PREF=tz=Asia.Shanghai" \
             "https://www.youtube.com/premium" 2>&1)
         local CUR_REGION
         CUR_REGION=$(echo "$YT_TEST" | sed -n 's/.*"contentRegion":"\([^"]*\)".*/\1/p' | head -n 1)
 
-        # 3. 探测 Google 搜索底栏归属
+        # 3. 探测 Google 搜索底栏归属 (自适应双栈)
         local GOOGLE_PAGE
-        GOOGLE_PAGE=$(curl -sL -4 --interface warp0 --max-time 6 -H "Accept-Language: en-US,en" "https://www.google.com" 2>/dev/null)
+        GOOGLE_PAGE=$(curl -sL --interface warp0 --max-time 6 -H "Accept-Language: en-US,en" "https://www.google.com" 2>/dev/null)
         local GOOGLE_LOC
         GOOGLE_LOC=$(echo "$GOOGLE_PAGE" | grep -oP '\[1,null,null,\d+,\d+,"\K[A-Z]{3}' | head -n 1)
 
         echo -e "[探测] 当前出口 IP: ${CYAN}${WARP_IP:-获取中}${NC} | Cloudflare地区: [${CF_LOC:-未知}] | YouTube地区: [${CUR_REGION:-未知}] | Google定位: [${GOOGLE_LOC:-未知}]"
 
-        # 严格精准判定限制区 (只认国家代码，杜绝 HTML 源码误匹配)
+        # 严格精准判定限制区 (必须有正常IP，且 Cloudflare/YouTube 必须是非受限区)
         local IS_RESTRICTED=0
-        if [ "$CUR_REGION" == "RU" ] || [ "$CUR_REGION" == "CN" ] || [ "$CF_LOC" == "RU" ] || [ "$CF_LOC" == "CN" ] || [ "$GOOGLE_LOC" == "RUS" ] || [ "$GOOGLE_LOC" == "CHN" ]; then
+        if [ -z "$WARP_IP" ] || [ "$CF_LOC" == "RU" ] || [ "$CF_LOC" == "CN" ] || [ "$CUR_REGION" == "RU" ] || [ "$CUR_REGION" == "CN" ]; then
             IS_RESTRICTED=1
         fi
 
