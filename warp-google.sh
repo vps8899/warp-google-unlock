@@ -70,14 +70,19 @@ EOF
     # 6. 销毁 ipset 集合
     ipset destroy warp_unlock 2>/dev/null || true
 
-    # 7. 清除配置文件与启动脚本
+    # 7. 清除配置文件与启动脚本，还原 wg-quick 并清理 wireguard-go
     rm -f /etc/dnsmasq.d/warp_unlock.conf \
           /etc/dnsmasq.d/warp-google.conf \
           /usr/local/bin/warp-route-apply.sh \
           /usr/local/bin/wgcf \
           /etc/systemd/system/warp-unlock.service \
           /etc/wireguard/warp0.conf \
+          /usr/bin/wireguard-go \
           /etc/warp-unlock/wgcf-profile.conf 2>/dev/null || true
+
+    if [ -f /usr/bin/wg-quick ]; then
+        sed -i '/wireguard-go/d; s/^#\s*add_if/add_if/' /usr/bin/wg-quick 2>/dev/null || true
+    fi
 
     systemctl daemon-reload 2>/dev/null || true
     echo -e "${GREEN}✓ 深度清理完毕！系统网络与 DNS 已彻底恢复纯净原生状态。${NC}\n"
@@ -186,23 +191,7 @@ install_dependencies() {
         dnf install -y wireguard-tools ipset dnsmasq curl wget iptables iptables-services jq e2fsprogs >/dev/null 2>&1
     elif command -v yum &>/dev/null; then
         yum install -y epel-release >/dev/null 2>&1
-        yum install -y wireguard-tools ipset dnsmasq curl wget iptables iptables-services jq e2fsprogs python3 >/dev/null 2>&1
-    fi
-
-    # 关键修复: 下载支持 Cloudflare WARP Reserved 认证特征码的 wireguard-go 用户态驱动
-    # 彻底解决 2024~2026 年 Cloudflare 拒绝原生 Linux 内核握手导致的 [0 B received] 隧道死锁问题
-    local ARCH=$(uname -m)
-    local WG_GO_ARCH="amd64"
-    [ "$ARCH" == "aarch64" ] && WG_GO_ARCH="arm64"
-    if [ ! -s /usr/bin/wireguard-go ]; then
-        echo -e "${CYAN}正在下载 Cloudflare 协议认证引擎 (wireguard-go reserved)...${NC}"
-        curl -sLo /usr/bin/wireguard-go "https://gitlab.com/fscarmen/warp/-/raw/main/wireguard-go/wireguard-go-linux-${WG_GO_ARCH}-20230223" 2>/dev/null || \
-        wget -qO /usr/bin/wireguard-go "https://gitlab.com/fscarmen/warp/-/raw/main/wireguard-go/wireguard-go-linux-${WG_GO_ARCH}-20230223" 2>/dev/null
-        chmod +x /usr/bin/wireguard-go 2>/dev/null || true
-    fi
-
-    if [ -f /usr/bin/wireguard-go ] && [ -f /usr/bin/wg-quick ]; then
-        grep -q 'wireguard-go "$INTERFACE"' /usr/bin/wg-quick || sed -i '/add_if$/ {s/^/# /; N; s/\n/&\twireguard-go "$INTERFACE"\n/}' /usr/bin/wg-quick
+        yum install -y wireguard-tools ipset dnsmasq curl wget iptables iptables-services jq e2fsprogs >/dev/null 2>&1
     fi
 }
 
@@ -264,22 +253,27 @@ setup_warp_profile() {
         exit 1
     fi
 
-    # 核心技术修复: 提取 Cloudflare 官方设备认证特征码 (client_id -> Reserved 3 字节)
-    # 填补握手包空缺，彻底让 Cloudflare 服务端响应并完成握手
-    local CLIENT_ID
-    CLIENT_ID=$(echo "$RESPONSE" | grep -oP '"client_id"\s*:\s*"\K[^"]+' | head -n 1)
-    local RESERVED_LINE=""
-    if [ -n "$CLIENT_ID" ]; then
-        local RESERVED_DEC
-        RESERVED_DEC=$(python3 -c "import base64; print(','.join(str(b) for b in base64.b64decode('$CLIENT_ID')))" 2>/dev/null)
-        if [ -n "$RESERVED_DEC" ]; then
-            RESERVED_LINE="Reserved = $RESERVED_DEC"
-            echo -e "${GREEN}✓ 已提取 Cloudflare 设备认证特征码: [${RESERVED_DEC}]${NC}"
+    # 终极修复: 激活 Cloudflare WARP 官方账号授权 (warp_enabled: true)
+    # 彻底解决新注册设备默认处于关闭状态导致握手被服务器静默丢弃 (0 B received) 的问题！
+    local DEV_ID
+    DEV_ID=$(echo "$RESPONSE" | grep -oP '"id"\s*:\s*"\K[^"]+' | head -n 1)
+    local TOKEN
+    TOKEN=$(echo "$RESPONSE" | grep -oP '"token"\s*:\s*"\K[^"]+' | head -n 1)
+
+    if [ -n "$DEV_ID" ] && [ -n "$TOKEN" ]; then
+        local PATCH_RES
+        PATCH_RES=$(curl -4 -s -X PATCH -H 'User-Agent: okhttp/3.12.1' -H 'CF-Client-Version: a-6.3-2158' -H 'Content-Type: application/json' \
+          -H "Authorization: Bearer $TOKEN" \
+          -d '{"warp_enabled":true}' \
+          "https://api.cloudflareclient.com/v0a2158/reg/$DEV_ID")
+        if echo "$PATCH_RES" | grep -q '"warp_enabled":\s*true'; then
+            echo -e "${GREEN}✓ Cloudflare WARP 官方授权已成功激活 (warp_enabled: true)${NC}"
         fi
     fi
 
     # 不添加 DNS 避免触发 resolvconf 权限冲突，显式设置 MTU=1280 杜绝握手大包分片黑洞
     # PostUp 绑定网卡生命周期，确保无论何时重启网卡，路由表 51820 与 MASQUERADE 规则永不丢失
+    # 配置文件采用官方标准 WireGuard 规范 (移除一切导致 Line unrecognized 的非标参数)
     cat > /etc/wireguard/warp0.conf << EOF
 [Interface]
 PrivateKey = $PRIVKEY
@@ -293,7 +287,6 @@ PostDown = ip route flush table 51820 2>/dev/null || true
 PublicKey = ${PEER_PUBKEY:-bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=}
 Endpoint = $TARGET_EP
 AllowedIPs = 0.0.0.0/0, ::/0
-${RESERVED_LINE}
 PersistentKeepalive = 25
 EOF
 
@@ -453,10 +446,10 @@ if [ $HANDSHAKE_OK -eq 0 ]; then
     CURRENT_EP=$(grep 'Endpoint' /etc/wireguard/warp0.conf | awk '{print $3}')
     CURRENT_HOST=$(echo "$CURRENT_EP" | cut -d: -f1)
     for ALT_PORT in 500 1701 4500 2408; do
-        wg-quick down warp0 2>/dev/null || true
+        wg-quick down warp0 >/dev/null 2>&1 || true
         sed -i "s|Endpoint = .*|Endpoint = ${CURRENT_HOST}:${ALT_PORT}|" /etc/wireguard/warp0.conf
-        wg-quick up warp0
-        for j in $(seq 1 5); do
+        wg-quick up warp0 >/dev/null 2>&1
+        for j in $(seq 1 4); do
             sleep 1
             if wg show warp0 2>/dev/null | grep -q "latest handshake"; then
                 HANDSHAKE_OK=1
@@ -469,10 +462,10 @@ fi
 # 如果所有端口都失败，尝试不同的 Endpoint IP
 if [ $HANDSHAKE_OK -eq 0 ]; then
     for ALT_EP in 162.159.192.1:2408 162.159.195.1:2408 188.114.96.1:2408 188.114.97.1:2408; do
-        wg-quick down warp0 2>/dev/null || true
+        wg-quick down warp0 >/dev/null 2>&1 || true
         sed -i "s|Endpoint = .*|Endpoint = ${ALT_EP}|" /etc/wireguard/warp0.conf
-        wg-quick up warp0
-        for j in $(seq 1 5); do
+        wg-quick up warp0 >/dev/null 2>&1
+        for j in $(seq 1 4); do
             sleep 1
             if wg show warp0 2>/dev/null | grep -q "latest handshake"; then
                 HANDSHAKE_OK=1
