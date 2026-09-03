@@ -186,7 +186,23 @@ install_dependencies() {
         dnf install -y wireguard-tools ipset dnsmasq curl wget iptables iptables-services jq e2fsprogs >/dev/null 2>&1
     elif command -v yum &>/dev/null; then
         yum install -y epel-release >/dev/null 2>&1
-        yum install -y wireguard-tools ipset dnsmasq curl wget iptables iptables-services jq e2fsprogs >/dev/null 2>&1
+        yum install -y wireguard-tools ipset dnsmasq curl wget iptables iptables-services jq e2fsprogs python3 >/dev/null 2>&1
+    fi
+
+    # 关键修复: 下载支持 Cloudflare WARP Reserved 认证特征码的 wireguard-go 用户态驱动
+    # 彻底解决 2024~2026 年 Cloudflare 拒绝原生 Linux 内核握手导致的 [0 B received] 隧道死锁问题
+    local ARCH=$(uname -m)
+    local WG_GO_ARCH="amd64"
+    [ "$ARCH" == "aarch64" ] && WG_GO_ARCH="arm64"
+    if [ ! -s /usr/bin/wireguard-go ]; then
+        echo -e "${CYAN}正在下载 Cloudflare 协议认证引擎 (wireguard-go reserved)...${NC}"
+        curl -sLo /usr/bin/wireguard-go "https://gitlab.com/fscarmen/warp/-/raw/main/wireguard-go/wireguard-go-linux-${WG_GO_ARCH}-20230223" 2>/dev/null || \
+        wget -qO /usr/bin/wireguard-go "https://gitlab.com/fscarmen/warp/-/raw/main/wireguard-go/wireguard-go-linux-${WG_GO_ARCH}-20230223" 2>/dev/null
+        chmod +x /usr/bin/wireguard-go 2>/dev/null || true
+    fi
+
+    if [ -f /usr/bin/wireguard-go ] && [ -f /usr/bin/wg-quick ]; then
+        grep -q 'wireguard-go "$INTERFACE"' /usr/bin/wg-quick || sed -i '/add_if$/ {s/^/# /; N; s/\n/&\twireguard-go "$INTERFACE"\n/}' /usr/bin/wg-quick
     fi
 }
 
@@ -248,6 +264,20 @@ setup_warp_profile() {
         exit 1
     fi
 
+    # 核心技术修复: 提取 Cloudflare 官方设备认证特征码 (client_id -> Reserved 3 字节)
+    # 填补握手包空缺，彻底让 Cloudflare 服务端响应并完成握手
+    local CLIENT_ID
+    CLIENT_ID=$(echo "$RESPONSE" | grep -oP '"client_id"\s*:\s*"\K[^"]+' | head -n 1)
+    local RESERVED_LINE=""
+    if [ -n "$CLIENT_ID" ]; then
+        local RESERVED_DEC
+        RESERVED_DEC=$(python3 -c "import base64; print(','.join(str(b) for b in base64.b64decode('$CLIENT_ID')))" 2>/dev/null)
+        if [ -n "$RESERVED_DEC" ]; then
+            RESERVED_LINE="Reserved = $RESERVED_DEC"
+            echo -e "${GREEN}✓ 已提取 Cloudflare 设备认证特征码: [${RESERVED_DEC}]${NC}"
+        fi
+    fi
+
     # 不添加 DNS 避免触发 resolvconf 权限冲突，显式设置 MTU=1280 杜绝握手大包分片黑洞
     # PostUp 绑定网卡生命周期，确保无论何时重启网卡，路由表 51820 与 MASQUERADE 规则永不丢失
     cat > /etc/wireguard/warp0.conf << EOF
@@ -263,6 +293,7 @@ PostDown = ip route flush table 51820 2>/dev/null || true
 PublicKey = ${PEER_PUBKEY:-bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=}
 Endpoint = $TARGET_EP
 AllowedIPs = 0.0.0.0/0, ::/0
+${RESERVED_LINE}
 PersistentKeepalive = 25
 EOF
 
