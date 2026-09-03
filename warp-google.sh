@@ -427,22 +427,41 @@ done
 ip rule del fwmark 51820 lookup 51820 2>/dev/null || true
 ip rule add fwmark 51820 lookup 51820 priority 100
 
-# 3. 启动 WireGuard 虚拟网卡并进行热切换极速握手
+# 3. 启动 WireGuard 虚拟网卡并进行握手建立
 wg-quick down warp0 >/dev/null 2>&1 || true
 wg-quick up warp0 >/dev/null 2>&1
 
-# 极速热探测黄金接入点与端口 (秒级生效)
-for ep in "162.159.192.1:2408" "162.159.192.1:500" "162.159.193.10:2408" "162.159.193.10:500" "188.114.96.1:2408" "188.114.97.1:2408"; do
-    wg set warp0 peer bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo= endpoint "$ep" 2>/dev/null || true
-    sleep 2
+# 稳定等待黄金接入点 162.159.192.1:2408 握手建立 (最多等 6 秒，绝不提前强行掐断重置)
+HANDSHAKE_OK=0
+for s in $(seq 1 6); do
+    sleep 1
     RX=$(wg show warp0 transfer 2>/dev/null | awk '{print $2}')
     if [ -n "$RX" ] && [ "$RX" -gt 0 ]; then
-        sed -i "s|Endpoint = .*|Endpoint = $ep|" /etc/wireguard/warp0.conf
+        HANDSHAKE_OK=1
         break
     fi
 done
 
-[ -d /proc/sys/net/ipv4/conf/warp0 ] && sysctl -w net.ipv4.conf.warp0.rp_filter=2 >/dev/null 2>&1
+# 若主节点未响应，平滑热切备用节点 (162.159.193.10:2408) 再次等待
+if [ $HANDSHAKE_OK -eq 0 ]; then
+    for ep in "162.159.193.10:2408" "162.159.192.1:500"; do
+        wg set warp0 peer bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo= endpoint "$ep" 2>/dev/null || true
+        for s in $(seq 1 4); do
+            sleep 1
+            RX=$(wg show warp0 transfer 2>/dev/null | awk '{print $2}')
+            if [ -n "$RX" ] && [ "$RX" -gt 0 ]; then
+                sed -i "s|Endpoint = .*|Endpoint = $ep|" /etc/wireguard/warp0.conf
+                HANDSHAKE_OK=1
+                break 2
+            fi
+        done
+    done
+fi
+
+# 关闭全网卡 rp_filter 严格反向路径过滤，彻底防止策略路由回包被内核静默丢弃
+sysctl -w net.ipv4.conf.all.rp_filter=0 >/dev/null 2>&1
+sysctl -w net.ipv4.conf.default.rp_filter=0 >/dev/null 2>&1
+[ -d /proc/sys/net/ipv4/conf/warp0 ] && sysctl -w net.ipv4.conf.warp0.rp_filter=0 >/dev/null 2>&1
 
 # 4. 确保 51820 路由表的默认网关为 warp0 虚拟接口
 ip route flush table 51820 2>/dev/null || true
@@ -576,22 +595,22 @@ test_unlock_status() {
         echo -e "${GREEN}✓ WireGuard 隧道运行正常 (累计接收: ${RX_BYTES} 字节)${NC}"
     fi
 
-    # 1. 验证 YouTube 解锁
+    # 1. 验证 YouTube 解锁 (强制走 warp0 接口，确保测试的是 WARP 真实链路)
     local YT_TEST
-    YT_TEST=$(curl -sSL -4 --max-time 8 \
+    YT_TEST=$(curl -sSL -4 --interface warp0 --max-time 8 \
         -H "Accept-Language: en" \
         -b "YSC=BiCUU3-5Gdk; CONSENT=YES+cb.20220301-11-p0.en+FX+700; GPS=1; VISITOR_INFO1_LIVE=4VwPMkB7W5A; PREF=tz=Asia.Shanghai" \
         "https://www.youtube.com/premium" 2>&1)
     local YT_REG
     YT_REG=$(echo "$YT_TEST" | sed -n 's/.*"contentRegion":"\([^"]*\)".*/\1/p' | head -n 1)
 
-    # 2. 验证 Google 搜索
+    # 2. 验证 Google 搜索 (强制走 warp0 接口)
     local GOOGLE_CODE
-    GOOGLE_CODE=$(curl -sI -o /dev/null -w "%{http_code}" -L --max-time 8 https://www.google.com/ncr)
+    GOOGLE_CODE=$(curl -sI -o /dev/null -w "%{http_code}" -L --interface warp0 --max-time 8 https://www.google.com/ncr)
     
-    # 3. 验证 Gemini / Antigravity (检测地区是否支持)
+    # 3. 验证 Gemini / Antigravity (强制走 warp0 接口)
     local GEMINI_RES
-    GEMINI_RES=$(curl -sL -4 --max-time 8 -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" -H "Accept-Language: en-US,en" https://gemini.google.com 2>&1)
+    GEMINI_RES=$(curl -sL -4 --interface warp0 --max-time 8 -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" -H "Accept-Language: en-US,en" https://gemini.google.com 2>&1)
     local GEMINI_OK=1
     if echo "$GEMINI_RES" | grep -qiE "not supported in your country|country_unavailable|not available in your region"; then
         GEMINI_OK=0
