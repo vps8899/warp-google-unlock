@@ -530,14 +530,13 @@ ensure_clean_warp_region() {
 
         if [ $IS_RESTRICTED -eq 1 ]; then
             ((retry_count++))
-            echo -e "${YELLOW}[尝试 $retry_count/$max_retries] WARP 当前分配至 [${CUR_REGION:-$GOOGLE_LOC}] (俄罗斯/中国限制区，Gemini不可用)，正在自动刷新获取新 IP...${NC}"
+            echo -e "${YELLOW}[尝试 $retry_count/$max_retries] WARP 当前分配至 [${CUR_REGION:-$GOOGLE_LOC}] (限制区)，正在热切换节点获取新 IP...${NC}"
             
-            # 选择下一个 Endpoint
+            # 选择下一个黄金 Endpoint 并热切换，保留合法的官方已激活凭据
             local next_ep=${WARP_ENDPOINTS[$((retry_count % ep_count))]}
-            
-            # 重新生成配置并完整应用策略路由与 WireGuard (彻底杜绝路由丢失)
-            setup_warp_profile "$next_ep"
-            /usr/local/bin/warp-route-apply.sh
+            wg set warp0 peer bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo= endpoint "$next_ep" 2>/dev/null || true
+            sed -i "s|Endpoint = .*|Endpoint = $next_ep|" /etc/wireguard/warp0.conf
+            sleep 3
         else
             echo -e "${GREEN}✓ 成功锁定 WARP 纯净出口地区: [${CUR_REGION:-${GOOGLE_LOC:-US}}] (非受限区，完美支持 Google / Gemini / YouTube！)${NC}"
             return 0
@@ -560,21 +559,21 @@ test_unlock_status() {
     curl -sSL -4 --max-time 6 "https://chatgpt.com" >/dev/null 2>&1
     sleep 1
 
-    # 0. 校验 WireGuard 隧道握手状态 (用 wg show 而非 curl --interface，避免路由冲突)
-    if ! wg show warp0 2>/dev/null | grep -q "latest handshake"; then
-        echo -e "${YELLOW}[注意] WireGuard 隧道握手尚未完成，正在等待建立...${NC}"
-        for _w in $(seq 1 10); do
+    # 0. 校验 WireGuard 隧道握手状态
+    local RX_BYTES
+    RX_BYTES=$(wg show warp0 transfer 2>/dev/null | awk '{print $2}')
+    if [ -z "$RX_BYTES" ] || [ "$RX_BYTES" -eq 0 ]; then
+        echo -e "${YELLOW}[注意] 正在与 Cloudflare 全球 Anycast 节点建立握手...${NC}"
+        for _w in $(seq 1 6); do
             sleep 1
-            if wg show warp0 2>/dev/null | grep -q "latest handshake"; then
-                echo -e "${GREEN}✓ WireGuard 隧道握手成功！${NC}"
+            RX_BYTES=$(wg show warp0 transfer 2>/dev/null | awk '{print $2}')
+            if [ -n "$RX_BYTES" ] && [ "$RX_BYTES" -gt 0 ]; then
+                echo -e "${GREEN}✓ WireGuard 隧道握手成功！(收到回包: ${RX_BYTES} 字节)${NC}"
                 break
             fi
         done
-        if ! wg show warp0 2>/dev/null | grep -q "latest handshake"; then
-            echo -e "${RED}[警告] WireGuard 隧道未能握手成功，正在重新初始化...${NC}"
-            /usr/local/bin/warp-route-apply.sh
-            sleep 3
-        fi
+    else
+        echo -e "${GREEN}✓ WireGuard 隧道运行正常 (累计接收: ${RX_BYTES} 字节)${NC}"
     fi
 
     # 1. 验证 YouTube 解锁
