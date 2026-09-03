@@ -65,6 +65,9 @@ auto_clean_old_warp() {
         iptables -t mangle -D PREROUTING -m set --match-set warp_unlock dst -j MARK --set-mark 51820 2>/dev/null || true
         iptables -t mangle -D POSTROUTING -p tcp --tcp-flags SYN,RST SYN -o warp0 -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true
         iptables -t nat -D POSTROUTING -o warp0 -j MASQUERADE 2>/dev/null || true
+        iptables -t nat -D PREROUTING -p udp --dport 53 -j REDIRECT --to-ports 53 2>/dev/null || true
+        iptables -t nat -D OUTPUT -p udp --dport 53 -d 127.0.0.1 -j ACCEPT 2>/dev/null || true
+        iptables -t nat -D OUTPUT -p udp --dport 53 -j REDIRECT --to-ports 53 2>/dev/null || true
         ip rule del fwmark 51820 lookup 51820 2>/dev/null || true
         ip route flush table 51820 2>/dev/null || true
 
@@ -252,12 +255,15 @@ setup_warp_profile() {
     fi
 
     # 不添加 DNS 避免触发 resolvconf 权限冲突，显式设置 MTU=1280 杜绝握手大包分片黑洞
+    # PostUp 绑定网卡生命周期，确保无论何时重启网卡，路由表 51820 与 MASQUERADE 规则永不丢失
     cat > /etc/wireguard/warp0.conf << EOF
 [Interface]
 PrivateKey = $PRIVKEY
 Address = ${IPV4_ADDR}/32, ${IPV6_ADDR:-2606:4700:110:8::1}/128
 MTU = 1280
 Table = off
+PostUp = ip rule add fwmark 51820 lookup 51820 priority 100 2>/dev/null || true; ip route replace default dev warp0 table 51820; iptables -t nat -D POSTROUTING -o warp0 -j MASQUERADE 2>/dev/null || true; iptables -t nat -A POSTROUTING -o warp0 -j MASQUERADE; iptables -t mangle -D POSTROUTING -p tcp --tcp-flags SYN,RST SYN -o warp0 -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true; iptables -t mangle -A POSTROUTING -p tcp --tcp-flags SYN,RST SYN -o warp0 -j TCPMSS --clamp-mss-to-pmtu
+PostDown = ip route flush table 51820 2>/dev/null || true
 
 [Peer]
 PublicKey = ${PEER_PUBKEY:-bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=}
@@ -356,8 +362,13 @@ sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1
 sysctl -w net.ipv4.conf.all.rp_filter=2 >/dev/null 2>&1
 sysctl -w net.ipv4.conf.default.rp_filter=2 >/dev/null 2>&1
 
-# 1. 创建 ipset 集合 (86400秒动态过期自动刷新)
-ipset create warp_unlock hash:ip timeout 86400 -exist
+# 1. 创建 ipset 集合 (升级为 hash:net，支持单个 IP 与 CIDR 网段，86400秒超时)
+ipset create warp_unlock hash:net timeout 86400 -exist
+
+# 预置 Google 全球核心骨干网段 (双重保险，零延迟防遗漏)
+for net in 142.250.0.0/15 172.217.0.0/16 216.58.192.0/19 173.194.0.0/16 74.125.0.0/16 64.233.160.0/19 66.102.0.0/20 66.249.64.0/19 108.177.0.0/17; do
+    ipset add warp_unlock "$net" -exist 2>/dev/null || true
+done
 
 # 2. 创建专用路由表 51820
 ip rule del fwmark 51820 lookup 51820 2>/dev/null || true
@@ -368,11 +379,11 @@ wg-quick down warp0 2>/dev/null || true
 wg-quick up warp0
 [ -d /proc/sys/net/ipv4/conf/warp0 ] && sysctl -w net.ipv4.conf.warp0.rp_filter=2 >/dev/null 2>&1
 
-# 4. 指定 51820 路由表的默认网关为 warp0 虚拟接口
+# 4. 确保 51820 路由表的默认网关为 warp0 虚拟接口
 ip route flush table 51820 2>/dev/null || true
-ip route add default dev warp0 table 51820
+ip route replace default dev warp0 table 51820
 
-# 5. iptables 标记匹配 ipset 的流量
+# 5. iptables 标记匹配 ipset 的流量 (OUTPUT 为代理服务端发起的出站)
 iptables -t mangle -D OUTPUT -m set --match-set warp_unlock dst -j MARK --set-mark 51820 2>/dev/null || true
 iptables -t mangle -A OUTPUT -m set --match-set warp_unlock dst -j MARK --set-mark 51820
 iptables -t mangle -D PREROUTING -m set --match-set warp_unlock dst -j MARK --set-mark 51820 2>/dev/null || true
@@ -385,6 +396,14 @@ iptables -t mangle -A POSTROUTING -p tcp --tcp-flags SYN,RST SYN -o warp0 -j TCP
 # 7. NAT MASQUERADE (最核心修复: 为 warp0 出口流量执行源地址伪装，避免源 IP 错误被丢弃)
 iptables -t nat -D POSTROUTING -o warp0 -j MASQUERADE 2>/dev/null || true
 iptables -t nat -A POSTROUTING -o warp0 -j MASQUERADE
+
+# 8. DNS 透明拦截劫持 (确保所有代理软件内置 DNS 均走本地 Dnsmasq 动态捕获)
+iptables -t nat -D PREROUTING -p udp --dport 53 -j REDIRECT --to-ports 53 2>/dev/null || true
+iptables -t nat -A PREROUTING -p udp --dport 53 -j REDIRECT --to-ports 53
+iptables -t nat -D OUTPUT -p udp --dport 53 -d 127.0.0.1 -j ACCEPT 2>/dev/null || true
+iptables -t nat -I OUTPUT 1 -p udp --dport 53 -d 127.0.0.1 -j ACCEPT
+iptables -t nat -D OUTPUT -p udp --dport 53 -j REDIRECT --to-ports 53 2>/dev/null || true
+iptables -t nat -A OUTPUT -p udp --dport 53 -j REDIRECT --to-ports 53
 EOF
     chmod +x /usr/local/bin/warp-route-apply.sh
     /usr/local/bin/warp-route-apply.sh
@@ -453,11 +472,9 @@ ensure_clean_warp_region() {
             # 选择下一个 Endpoint
             local next_ep=${WARP_ENDPOINTS[$((retry_count % ep_count))]}
             
-            # 重新生成配置并重启 WireGuard
+            # 重新生成配置并完整应用策略路由与 WireGuard (彻底杜绝路由丢失)
             setup_warp_profile "$next_ep"
-            wg-quick down warp0 2>/dev/null || true
-            wg-quick up warp0
-            [ -d /proc/sys/net/ipv4/conf/warp0 ] && sysctl -w net.ipv4.conf.warp0.rp_filter=2 >/dev/null 2>&1
+            /usr/local/bin/warp-route-apply.sh
         else
             echo -e "${GREEN}✓ 成功锁定 WARP 纯净出口地区: [${CUR_REGION:-${GOOGLE_LOC:-US}}] (非受限区，完美支持 Google / Gemini / YouTube！)${NC}"
             return 0
