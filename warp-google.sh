@@ -220,18 +220,25 @@ setup_warp_profile() {
       https://api.cloudflareclient.com/v0a2158/reg)
 
     local IPV4_ADDR
-    IPV4_ADDR=$(echo "$RESPONSE" | grep -oP '"v4":\s*"\K[0-9.]+' | head -n 1)
+    # 核心修复: 必须精准抓取 interface 字段下的内网地址 (恒为 172.16.0.2)，绝不能误抓 endpoint 的公网 IP
+    IPV4_ADDR=$(echo "$RESPONSE" | grep -A 8 '"interface"' | grep -oP '"v4":\s*"\K[0-9.]+' | head -n 1)
+    IPV4_ADDR=${IPV4_ADDR:-172.16.0.2}
+
     local IPV6_ADDR
-    IPV6_ADDR=$(echo "$RESPONSE" | grep -oP '"v6":\s*"\K[0-9a-fA-F:]+' | head -n 1)
+    IPV6_ADDR=$(echo "$RESPONSE" | grep -A 8 '"interface"' | grep -oP '"v6":\s*"\K[0-9a-fA-F:]+' | head -n 1)
+    IPV6_ADDR=${IPV6_ADDR:-2606:4700:110:8827:18b5:2de8:8b53:96e3}
+
     local PEER_PUBKEY
     PEER_PUBKEY=$(echo "$RESPONSE" | grep -oP '"public_key":\s*"\K[^"]+' | head -n 1)
+    PEER_PUBKEY=${PEER_PUBKEY:-bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=}
 
     # 备用 API 兜底
-    if [ -z "$PEER_PUBKEY" ] || [ -z "$IPV4_ADDR" ]; then
+    if [ -z "$RESPONSE" ] || echo "$RESPONSE" | grep -q '"success":false'; then
         RESPONSE=$(curl -4 -s -X POST -H 'User-Agent: okhttp/3.12.1' -H 'Content-Type: application/json' \
           -d "{\"key\":\"$PUBKEY\",\"tos\":\"$(date -u +%Y-%m-%dT%H:%M:%S.000Z)\"}" \
           https://api.cloudflareclient.com/v0a884/reg)
-        IPV4_ADDR=$(echo "$RESPONSE" | grep -oP '"v4":\s*"\K[0-9.]+' | head -n 1)
+        IPV4_ADDR=$(echo "$RESPONSE" | grep -A 8 '"interface"' | grep -oP '"v4":\s*"\K[0-9.]+' | head -n 1)
+        IPV4_ADDR=${IPV4_ADDR:-172.16.0.2}
         PEER_PUBKEY=$(echo "$RESPONSE" | grep -oP '"public_key":\s*"\K[^"]+' | head -n 1)
     fi
 
@@ -505,6 +512,15 @@ test_unlock_status() {
     curl -sSL -4 --max-time 6 "https://www.google.com" >/dev/null 2>&1
     curl -sSL -4 --max-time 6 "https://chatgpt.com" >/dev/null 2>&1
     sleep 2
+
+    # 0. 严密探测 WireGuard 虚拟网卡自身的真实握手连通性
+    local WARP_DIRECT
+    WARP_DIRECT=$(curl -sI -o /dev/null -w "%{http_code}" -4 --max-time 6 --interface warp0 https://www.google.com 2>/dev/null)
+    if [ "$WARP_DIRECT" != "200" ] && [ "$WARP_DIRECT" != "301" ] && [ "$WARP_DIRECT" != "302" ]; then
+        echo -e "${YELLOW}检测到 WARP 隧道初次握手未就绪 (返回: ${WARP_DIRECT:-超时})，正在自动重置网络栈...${NC}"
+        /usr/local/bin/warp-route-apply.sh
+        sleep 2
+    fi
 
     # 1. 验证 YouTube 解锁
     local YT_TEST
