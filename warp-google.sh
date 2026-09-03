@@ -278,7 +278,7 @@ setup_warp_profile() {
 [Interface]
 PrivateKey = $PRIVKEY
 Address = ${IPV4_ADDR}/32, ${IPV6_ADDR:-2606:4700:110:8::1}/128
-MTU = 1280
+MTU = 1200
 Table = off
 PostUp = ip rule add fwmark 51820 lookup 51820 priority 100 2>/dev/null || true; ip route replace default dev warp0 table 51820; iptables -t nat -D POSTROUTING -o warp0 -j MASQUERADE 2>/dev/null || true; iptables -t nat -A POSTROUTING -o warp0 -j MASQUERADE; iptables -t mangle -D POSTROUTING -p tcp --tcp-flags SYN,RST SYN -o warp0 -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true; iptables -t mangle -A POSTROUTING -p tcp --tcp-flags SYN,RST SYN -o warp0 -j TCPMSS --clamp-mss-to-pmtu
 PostDown = ip route flush table 51820 2>/dev/null || true
@@ -287,7 +287,7 @@ PostDown = ip route flush table 51820 2>/dev/null || true
 PublicKey = ${PEER_PUBKEY:-bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=}
 Endpoint = $TARGET_EP
 AllowedIPs = 0.0.0.0/0, ::/0
-PersistentKeepalive = 25
+PersistentKeepalive = 10
 EOF
 
     echo -e "${GREEN}✓ Cloudflare WARP 节点配置已生成 (Endpoint: $TARGET_EP)${NC}"
