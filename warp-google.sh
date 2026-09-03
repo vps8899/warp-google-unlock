@@ -393,9 +393,54 @@ done
 ip rule del fwmark 51820 lookup 51820 2>/dev/null || true
 ip rule add fwmark 51820 lookup 51820 priority 100
 
-# 3. 启动 WireGuard 虚拟网卡并设置网卡级别 rp_filter
+# 3. 启动 WireGuard 虚拟网卡并验证握手
 wg-quick down warp0 2>/dev/null || true
 wg-quick up warp0
+
+# 关键: 等待 WireGuard 握手完成 (最多等 8 秒)
+HANDSHAKE_OK=0
+for i in $(seq 1 8); do
+    sleep 1
+    if wg show warp0 2>/dev/null | grep -q "latest handshake"; then
+        HANDSHAKE_OK=1
+        break
+    fi
+done
+
+# 如果握手失败，自动尝试不同端口 (500/1701/4500)
+if [ $HANDSHAKE_OK -eq 0 ]; then
+    CURRENT_EP=$(grep 'Endpoint' /etc/wireguard/warp0.conf | awk '{print $3}')
+    CURRENT_HOST=$(echo "$CURRENT_EP" | cut -d: -f1)
+    for ALT_PORT in 500 1701 4500 2408; do
+        wg-quick down warp0 2>/dev/null || true
+        sed -i "s|Endpoint = .*|Endpoint = ${CURRENT_HOST}:${ALT_PORT}|" /etc/wireguard/warp0.conf
+        wg-quick up warp0
+        for j in $(seq 1 5); do
+            sleep 1
+            if wg show warp0 2>/dev/null | grep -q "latest handshake"; then
+                HANDSHAKE_OK=1
+                break 2
+            fi
+        done
+    done
+fi
+
+# 如果所有端口都失败，尝试不同的 Endpoint IP
+if [ $HANDSHAKE_OK -eq 0 ]; then
+    for ALT_EP in 162.159.192.1:2408 162.159.195.1:2408 188.114.96.1:2408 188.114.97.1:2408; do
+        wg-quick down warp0 2>/dev/null || true
+        sed -i "s|Endpoint = .*|Endpoint = ${ALT_EP}|" /etc/wireguard/warp0.conf
+        wg-quick up warp0
+        for j in $(seq 1 5); do
+            sleep 1
+            if wg show warp0 2>/dev/null | grep -q "latest handshake"; then
+                HANDSHAKE_OK=1
+                break 2
+            fi
+        done
+    done
+fi
+
 [ -d /proc/sys/net/ipv4/conf/warp0 ] && sysctl -w net.ipv4.conf.warp0.rp_filter=2 >/dev/null 2>&1
 
 # 4. 确保 51820 路由表的默认网关为 warp0 虚拟接口
@@ -512,15 +557,23 @@ test_unlock_status() {
     curl -sSL -4 --max-time 6 "https://www.youtube.com/premium" >/dev/null 2>&1
     curl -sSL -4 --max-time 6 "https://www.google.com" >/dev/null 2>&1
     curl -sSL -4 --max-time 6 "https://chatgpt.com" >/dev/null 2>&1
-    sleep 2
+    sleep 1
 
-    # 0. 严密探测 WireGuard 虚拟网卡自身的真实握手连通性
-    local WARP_DIRECT
-    WARP_DIRECT=$(curl -sI -o /dev/null -w "%{http_code}" -4 --max-time 6 --interface warp0 https://www.google.com 2>/dev/null)
-    if [ "$WARP_DIRECT" != "200" ] && [ "$WARP_DIRECT" != "301" ] && [ "$WARP_DIRECT" != "302" ]; then
-        echo -e "${YELLOW}检测到 WARP 隧道初次握手未就绪 (返回: ${WARP_DIRECT:-超时})，正在自动重置网络栈...${NC}"
-        /usr/local/bin/warp-route-apply.sh
-        sleep 2
+    # 0. 校验 WireGuard 隧道握手状态 (用 wg show 而非 curl --interface，避免路由冲突)
+    if ! wg show warp0 2>/dev/null | grep -q "latest handshake"; then
+        echo -e "${YELLOW}[注意] WireGuard 隧道握手尚未完成，正在等待建立...${NC}"
+        for _w in $(seq 1 10); do
+            sleep 1
+            if wg show warp0 2>/dev/null | grep -q "latest handshake"; then
+                echo -e "${GREEN}✓ WireGuard 隧道握手成功！${NC}"
+                break
+            fi
+        done
+        if ! wg show warp0 2>/dev/null | grep -q "latest handshake"; then
+            echo -e "${RED}[警告] WireGuard 隧道未能握手成功，正在重新初始化...${NC}"
+            /usr/local/bin/warp-route-apply.sh
+            sleep 3
+        fi
     fi
 
     # 1. 验证 YouTube 解锁
