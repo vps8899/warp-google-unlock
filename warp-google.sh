@@ -319,9 +319,6 @@ ipset=/chatgpt.com/warp_unlock
 ipset=/oaistatic.com/warp_unlock
 ipset=/oaiusercontent.com/warp_unlock
 ipset=/auth0.openai.com/warp_unlock
-
-# 过滤 IPv6 (AAAA) 解析，强制 Google/YouTube 走 IPv4 策略路由，避免代理走未分流的 IPv6 导致送中
-filter-aaaa
 EOF
 
     # 彻底停用 systemd-resolved 释放 53 端口，杜绝 Dnsmasq 启动失败
@@ -330,21 +327,36 @@ EOF
         systemctl disable systemd-resolved 2>/dev/null || true
     fi
 
+    # 测试配置语法，杜绝错误配置导致崩溃
+    if ! dnsmasq --test 2>/dev/null; then
+        echo -e "${YELLOW}[警告] Dnsmasq 配置存在不兼容语法，正在自动回退安全配置...${NC}"
+        cat > /etc/dnsmasq.d/warp_unlock.conf << 'EOF'
+server=8.8.8.8
+server=1.1.1.1
+cache-size=1000
+ipset=/google.com/warp_unlock
+ipset=/youtube.com/warp_unlock
+ipset=/googlevideo.com/warp_unlock
+ipset=/gemini.google.com/warp_unlock
+ipset=/chatgpt.com/warp_unlock
+EOF
+    fi
+
     systemctl restart dnsmasq
     systemctl enable dnsmasq >/dev/null 2>&1
-    
-    # 确保 /etc/resolv.conf 独立文件并锁定
-    chattr -i /etc/resolv.conf 2>/dev/null || true
-    rm -f /etc/resolv.conf
-    echo "nameserver 127.0.0.1" > /etc/resolv.conf
-    chattr +i /etc/resolv.conf 2>/dev/null || true
 
-    # 严格验证 Dnsmasq 运行状态
+    # 严格验证 Dnsmasq 运行状态，杜绝任何断网风险
     if systemctl is-active --quiet dnsmasq; then
+        chattr -i /etc/resolv.conf 2>/dev/null || true
+        rm -f /etc/resolv.conf
+        echo "nameserver 127.0.0.1" > /etc/resolv.conf
+        chattr +i /etc/resolv.conf 2>/dev/null || true
         echo -e "${GREEN}✓ DNS 动态嗅探组件运行正常，并已锁定 /etc/resolv.conf 防止 DHCP 覆盖${NC}"
     else
-        echo -e "${RED}[警告] Dnsmasq 服务未正常启动，正在尝试恢复...${NC}"
-        systemctl restart dnsmasq 2>/dev/null || true
+        echo -e "${YELLOW}[保护] Dnsmasq 暂未成功监听，已自动保持公共 DNS (8.8.8.8) 确保网络绝对畅通！${NC}"
+        chattr -i /etc/resolv.conf 2>/dev/null || true
+        rm -f /etc/resolv.conf
+        echo -e "nameserver 8.8.8.8\nnameserver 1.1.1.1" > /etc/resolv.conf
     fi
 }
 
