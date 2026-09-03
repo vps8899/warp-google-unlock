@@ -290,6 +290,7 @@ clear-on-reload
 ipset=/google.com/warp_unlock
 ipset=/google.co.jp/warp_unlock
 ipset=/google.com.hk/warp_unlock
+ipset=/google.com.tw/warp_unlock
 ipset=/google.cn/warp_unlock
 ipset=/googleapis.com/warp_unlock
 ipset=/googleusercontent.com/warp_unlock
@@ -297,6 +298,10 @@ ipset=/gstatic.com/warp_unlock
 ipset=/1e100.net/warp_unlock
 ipset=/google-analytics.com/warp_unlock
 ipset=/googletagmanager.com/warp_unlock
+ipset=/goo.gl/warp_unlock
+ipset=/google.dev/warp_unlock
+ipset=/web.dev/warp_unlock
+ipset=/chrome.com/warp_unlock
 
 # ----------------- 2. YouTube 全系列 (解决 YouTube 送中 / Premium 中国区限制) -----------------
 ipset=/youtube.com/warp_unlock
@@ -305,28 +310,33 @@ ipset=/ytimg.com/warp_unlock
 ipset=/googlevideo.com/warp_unlock
 ipset=/yt.be/warp_unlock
 
-# ----------------- 3. Google Play 商店 & 安卓全家桶 -----------------
+# ----------------- 3. Google Play 商店 & 安卓生态核心 CDN -----------------
 ipset=/android.com/warp_unlock
+ipset=/googleplay.com/warp_unlock
 ipset=/gvt1.com/warp_unlock
 ipset=/gvt2.com/warp_unlock
 ipset=/gvt3.com/warp_unlock
 ipset=/ggpht.com/warp_unlock
-ipset=/googleplay.com/warp_unlock
+ipset=/app-measurement.com/warp_unlock
 
-# ----------------- 4. Google AI 矩阵 (Gemini / Antigravity / DeepMind) -----------------
+# ----------------- 4. Google AI 全矩阵 (Gemini / Antigravity / AI Studio / NotebookLM) -----------------
 ipset=/gemini.google.com/warp_unlock
 ipset=/antigravity.google/warp_unlock
 ipset=/aistudio.google.com/warp_unlock
 ipset=/bard.google.com/warp_unlock
 ipset=/deepmind.com/warp_unlock
 ipset=/deepmind.google/warp_unlock
+ipset=/notebooklm.google/warp_unlock
+ipset=/generativeai.google/warp_unlock
 
-# ----------------- 5. OpenAI / ChatGPT 全系列 -----------------
+# ----------------- 5. OpenAI / ChatGPT & Claude 全系列 -----------------
 ipset=/openai.com/warp_unlock
 ipset=/chatgpt.com/warp_unlock
 ipset=/oaistatic.com/warp_unlock
 ipset=/oaiusercontent.com/warp_unlock
 ipset=/auth0.openai.com/warp_unlock
+ipset=/claude.ai/warp_unlock
+ipset=/anthropic.com/warp_unlock
 EOF
 
     # 彻底停用 systemd-resolved 释放 53 端口，杜绝 Dnsmasq 启动失败
