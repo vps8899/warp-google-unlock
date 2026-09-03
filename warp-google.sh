@@ -33,68 +33,52 @@ DEFAULT_IFACE=$(ip route show default 2>/dev/null | awk '{print $5}' | head -n 1
 # 功能 1：彻底检测并清理老版本脚本及各种历史残留
 # ---------------------------------------------------------
 auto_clean_old_warp() {
-    local has_old=0
+    echo -e "${YELLOW}[深度清理] 正在深度检测并彻底清除所有 WARP 策略路由、防火墙规则及旧版残留...${NC}"
+    
+    # 1. 解除 resolv.conf 写保护并恢复纯净原生 DNS
+    chattr -i /etc/resolv.conf 2>/dev/null || true
+    cat > /etc/resolv.conf << 'EOF'
+nameserver 8.8.8.8
+nameserver 1.1.1.1
+EOF
 
-    # 检测是否存在旧版残留标志
-    if command -v warp-cli &>/dev/null || \
-       [ -f /etc/wireguard/warp0.conf ] || \
-       [ -f /usr/local/bin/warp-route-apply.sh ] || \
-       [ -f /etc/systemd/system/warp-unlock.service ] || \
-       [ -f /etc/dnsmasq.d/warp_unlock.conf ] || \
-       iptables -t mangle -S 2>/dev/null | grep -q "warp_unlock" || \
-       ipset list warp_unlock &>/dev/null; then
-        has_old=1
-    fi
+    # 2. 停止并禁用所有相关 systemd 服务
+    systemctl stop warp-unlock.service warp-svc cloudflare-warp dnsmasq 2>/dev/null || true
+    systemctl disable warp-unlock.service warp-svc cloudflare-warp 2>/dev/null || true
+    
+    # 3. 停止 WireGuard 接口
+    command -v wg-quick &>/dev/null && wg-quick down warp0 2>/dev/null || true
+    command -v warp-cli &>/dev/null && warp-cli disconnect 2>/dev/null || true
 
-    if [ $has_old -eq 1 ]; then
-        echo -e "${YELLOW}[自检] 检测到历史/老版本 WARP 脚本残留，正在自动彻底清理...${NC}"
-        
-        # 1. 解除 resolv.conf 写保护
-        chattr -i /etc/resolv.conf 2>/dev/null || true
+    # 4. 彻底循环清理所有 iptables mangle / nat 规则 (while 循环清空，一条不剩)
+    while iptables -t mangle -D OUTPUT -m set --match-set warp_unlock dst -j MARK --set-mark 51820 2>/dev/null; do :; done
+    while iptables -t mangle -D PREROUTING -m set --match-set warp_unlock dst -j MARK --set-mark 51820 2>/dev/null; do :; done
+    while iptables -t mangle -D POSTROUTING -p tcp --tcp-flags SYN,RST SYN -o warp0 -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null; do :; done
+    while iptables -t nat -D POSTROUTING -o warp0 -j MASQUERADE 2>/dev/null; do :; done
+    while iptables -t nat -D PREROUTING -p udp --dport 53 -j REDIRECT --to-ports 53 2>/dev/null; do :; done
+    while iptables -t nat -D PREROUTING -p tcp --dport 53 -j REDIRECT --to-ports 53 2>/dev/null; do :; done
+    while iptables -t nat -D OUTPUT -p udp --dport 53 -d 127.0.0.1 -j ACCEPT 2>/dev/null; do :; done
+    while iptables -t nat -D OUTPUT -p udp --dport 53 -j REDIRECT --to-ports 53 2>/dev/null; do :; done
+    while iptables -t nat -D OUTPUT -p tcp --dport 53 -j REDIRECT --to-ports 53 2>/dev/null; do :; done
 
-        # 2. 停止并禁用所有相关 systemd 服务
-        systemctl stop warp-unlock.service warp-svc cloudflare-warp 2>/dev/null || true
-        systemctl disable warp-unlock.service warp-svc cloudflare-warp 2>/dev/null || true
-        
-        # 3. 停止 WireGuard 接口
-        command -v wg-quick &>/dev/null && wg-quick down warp0 2>/dev/null || true
-        command -v warp-cli &>/dev/null && warp-cli disconnect 2>/dev/null || true
+    # 5. 彻底循环清理策略路由表与规则
+    while ip rule del fwmark 51820 lookup 51820 2>/dev/null; do :; done
+    ip route flush table 51820 2>/dev/null || true
 
-        # 4. 清理 iptables mangle/nat 规则与策略路由
-        iptables -t mangle -D OUTPUT -m set --match-set warp_unlock dst -j MARK --set-mark 51820 2>/dev/null || true
-        iptables -t mangle -D PREROUTING -m set --match-set warp_unlock dst -j MARK --set-mark 51820 2>/dev/null || true
-        iptables -t mangle -D POSTROUTING -p tcp --tcp-flags SYN,RST SYN -o warp0 -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true
-        iptables -t nat -D POSTROUTING -o warp0 -j MASQUERADE 2>/dev/null || true
-        iptables -t nat -D PREROUTING -p udp --dport 53 -j REDIRECT --to-ports 53 2>/dev/null || true
-        iptables -t nat -D OUTPUT -p udp --dport 53 -d 127.0.0.1 -j ACCEPT 2>/dev/null || true
-        iptables -t nat -D OUTPUT -p udp --dport 53 -j REDIRECT --to-ports 53 2>/dev/null || true
-        ip rule del fwmark 51820 lookup 51820 2>/dev/null || true
-        ip route flush table 51820 2>/dev/null || true
+    # 6. 销毁 ipset 集合
+    ipset destroy warp_unlock 2>/dev/null || true
 
-        # 5. 销毁 ipset 集合
-        ipset destroy warp_unlock 2>/dev/null || true
+    # 7. 清除配置文件与启动脚本
+    rm -f /etc/dnsmasq.d/warp_unlock.conf \
+          /etc/dnsmasq.d/warp-google.conf \
+          /usr/local/bin/warp-route-apply.sh \
+          /usr/local/bin/wgcf \
+          /etc/systemd/system/warp-unlock.service \
+          /etc/wireguard/warp0.conf \
+          /etc/warp-unlock/wgcf-profile.conf 2>/dev/null || true
 
-        # 6. 清除旧版配置文件与脚本
-        rm -f /etc/dnsmasq.d/warp_unlock.conf \
-              /etc/dnsmasq.d/warp-google.conf \
-              /usr/local/bin/warp-route-apply.sh \
-              /usr/local/bin/wgcf \
-              /etc/systemd/system/warp-unlock.service \
-              /etc/wireguard/warp0.conf \
-              /etc/warp-unlock/wgcf-profile.conf 2>/dev/null || true
-
-        # 7. 恢复系统 DNS 解析
-        if [ -f /etc/resolv.conf.warp.bak ]; then
-            cp -f /etc/resolv.conf.warp.bak /etc/resolv.conf
-        else
-            echo "nameserver 8.8.8.8" > /etc/resolv.conf
-            echo "nameserver 1.1.1.1" >> /etc/resolv.conf
-        fi
-
-        systemctl daemon-reload 2>/dev/null || true
-        systemctl restart dnsmasq 2>/dev/null || true
-        echo -e "${GREEN}✓ 历史残留规则与配置文件已彻底清理！${NC}\n"
-    fi
+    systemctl daemon-reload 2>/dev/null || true
+    echo -e "${GREEN}✓ 深度清理完毕！系统网络与 DNS 已彻底恢复纯净原生状态。${NC}\n"
 }
 
 # ---------------------------------------------------------
@@ -288,6 +272,9 @@ setup_dnsmasq_rules() {
     cat > /etc/dnsmasq.d/warp_unlock.conf << 'EOF'
 server=8.8.8.8
 server=1.1.1.1
+cache-size=2000
+no-resolv
+clear-on-reload
 
 # ----------------- 1. Google 搜索与核心基础服务 -----------------
 ipset=/google.com/warp_unlock
@@ -396,14 +383,6 @@ iptables -t mangle -A POSTROUTING -p tcp --tcp-flags SYN,RST SYN -o warp0 -j TCP
 # 7. NAT MASQUERADE (最核心修复: 为 warp0 出口流量执行源地址伪装，避免源 IP 错误被丢弃)
 iptables -t nat -D POSTROUTING -o warp0 -j MASQUERADE 2>/dev/null || true
 iptables -t nat -A POSTROUTING -o warp0 -j MASQUERADE
-
-# 8. DNS 透明拦截劫持 (确保所有代理软件内置 DNS 均走本地 Dnsmasq 动态捕获)
-iptables -t nat -D PREROUTING -p udp --dport 53 -j REDIRECT --to-ports 53 2>/dev/null || true
-iptables -t nat -A PREROUTING -p udp --dport 53 -j REDIRECT --to-ports 53
-iptables -t nat -D OUTPUT -p udp --dport 53 -d 127.0.0.1 -j ACCEPT 2>/dev/null || true
-iptables -t nat -I OUTPUT 1 -p udp --dport 53 -d 127.0.0.1 -j ACCEPT
-iptables -t nat -D OUTPUT -p udp --dport 53 -j REDIRECT --to-ports 53 2>/dev/null || true
-iptables -t nat -A OUTPUT -p udp --dport 53 -j REDIRECT --to-ports 53
 EOF
     chmod +x /usr/local/bin/warp-route-apply.sh
     /usr/local/bin/warp-route-apply.sh
