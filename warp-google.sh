@@ -517,52 +517,57 @@ ensure_clean_warp_region() {
     local max_retries=6
     local retry_count=0
     local ep_count=${#WARP_ENDPOINTS[@]}
-    local CUR_REGION=""
-    local GOOGLE_LOC=""
 
     while [ $retry_count -lt $max_retries ]; do
         sleep 2
-        # 预热 DNS
-        curl -sSL -4 --max-time 6 "https://www.youtube.com/premium" >/dev/null 2>&1
-        curl -sSL -4 --max-time 6 "https://www.google.com" >/dev/null 2>&1
         
-        # 探测当前 WARP 出口的 YouTube 归属
+        # 1. 获取 Cloudflare 官方权威 trace 信息与出口公网 IP
+        local TRACE_INFO
+        TRACE_INFO=$(curl -s --interface warp0 --max-time 5 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null)
+        local WARP_IP
+        WARP_IP=$(echo "$TRACE_INFO" | grep "^ip=" | cut -d= -f2)
+        local CF_LOC
+        CF_LOC=$(echo "$TRACE_INFO" | grep "^loc=" | cut -d= -f2)
+
+        # 2. 探测当前 WARP 出口的 YouTube 归属
         local YT_TEST
-        YT_TEST=$(curl -sSL -4 --max-time 8 \
+        YT_TEST=$(curl -sSL -4 --interface warp0 --max-time 6 \
             -H "Accept-Language: en" \
             -b "YSC=BiCUU3-5Gdk; CONSENT=YES+cb.20220301-11-p0.en+FX+700; GPS=1; VISITOR_INFO1_LIVE=4VwPMkB7W5A; PREF=tz=Asia.Shanghai" \
             "https://www.youtube.com/premium" 2>&1)
+        local CUR_REGION
         CUR_REGION=$(echo "$YT_TEST" | sed -n 's/.*"contentRegion":"\([^"]*\)".*/\1/p' | head -n 1)
 
-        # 探测 Google 搜索归属
+        # 3. 探测 Google 搜索底栏归属
         local GOOGLE_PAGE
-        GOOGLE_PAGE=$(curl -sL -4 --max-time 8 -H "Accept-Language: en-US,en" "https://www.google.com" 2>/dev/null)
+        GOOGLE_PAGE=$(curl -sL -4 --interface warp0 --max-time 6 -H "Accept-Language: en-US,en" "https://www.google.com" 2>/dev/null)
+        local GOOGLE_LOC
         GOOGLE_LOC=$(echo "$GOOGLE_PAGE" | grep -oP '\[1,null,null,\d+,\d+,"\K[A-Z]{3}' | head -n 1)
 
-        # 判定是否为受限地区 (RU / CN / CHN / RUS)
+        echo -e "[探测] 当前出口 IP: ${CYAN}${WARP_IP:-获取中}${NC} | Cloudflare地区: [${CF_LOC:-未知}] | YouTube地区: [${CUR_REGION:-未知}] | Google定位: [${GOOGLE_LOC:-未知}]"
+
+        # 严格精准判定限制区 (只认国家代码，杜绝 HTML 源码误匹配)
         local IS_RESTRICTED=0
-        if [ "$CUR_REGION" == "RU" ] || [ "$CUR_REGION" == "CN" ] || echo "$YT_TEST" | grep -q "www.google.cn"; then
-            IS_RESTRICTED=1
-        elif [ "$GOOGLE_LOC" == "RUS" ] || [ "$GOOGLE_LOC" == "CHN" ]; then
+        if [ "$CUR_REGION" == "RU" ] || [ "$CUR_REGION" == "CN" ] || [ "$CF_LOC" == "RU" ] || [ "$CF_LOC" == "CN" ] || [ "$GOOGLE_LOC" == "RUS" ] || [ "$GOOGLE_LOC" == "CHN" ]; then
             IS_RESTRICTED=1
         fi
 
         if [ $IS_RESTRICTED -eq 1 ]; then
             ((retry_count++))
-            echo -e "${YELLOW}[尝试 $retry_count/$max_retries] WARP 当前分配至 [${CUR_REGION:-$GOOGLE_LOC}] (限制区)，正在热切换节点获取新 IP...${NC}"
+            echo -e "${YELLOW}[尝试 $retry_count/$max_retries] 当前出口为受限区，正在热切换接入点刷新 IP...${NC}"
             
-            # 选择下一个黄金 Endpoint 并热切换，保留合法的官方已激活凭据
+            # 选择下一个黄金 Endpoint 并热切换
             local next_ep=${WARP_ENDPOINTS[$((retry_count % ep_count))]}
             wg set warp0 peer bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo= endpoint "$next_ep" 2>/dev/null || true
             sed -i "s|Endpoint = .*|Endpoint = $next_ep|" /etc/wireguard/warp0.conf
             sleep 3
         else
-            echo -e "${GREEN}✓ 成功锁定 WARP 纯净出口地区: [${CUR_REGION:-${GOOGLE_LOC:-US}}] (非受限区，完美支持 Google / Gemini / YouTube！)${NC}"
+            echo -e "${GREEN}✓ 成功锁定 WARP 纯净出口 IP: ${WARP_IP} (地区: [${CF_LOC:-${CUR_REGION:-US}}]，完美支持 Google / Gemini / YouTube！)${NC}"
             return 0
         fi
     done
 
-    echo -e "${YELLOW}⚠ 已达自动重试上限，当前 WARP 地区为 [${CUR_REGION:-未知}]${NC}"
+    echo -e "${YELLOW}⚠ 已达自动重试上限，当前 WARP 出口 IP 为: ${WARP_IP:-未知} (地区: [${CF_LOC:-$CUR_REGION}])${NC}"
     return 1
 }
 
