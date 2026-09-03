@@ -201,10 +201,21 @@ install_dependencies() {
     fi
 }
 
+# 候选优质 WARP Endpoint 列表 (覆盖主流优质节点)
+WARP_ENDPOINTS=(
+    "162.159.193.10:2408"
+    "162.159.192.1:2408"
+    "162.159.195.1:2408"
+    "188.114.96.1:2408"
+    "188.114.97.1:2408"
+    "188.114.98.1:2408"
+)
+
 # ---------------------------------------------------------
 # 原生 API 注册 Cloudflare WARP 节点配置 (强推 IPv4，完美适配 RackNerd)
 # ---------------------------------------------------------
 setup_warp_profile() {
+    local TARGET_EP="${1:-${WARP_ENDPOINTS[0]}}"
     echo -e "\n${CYAN}[2/4] 正在通过 Cloudflare 原生 API 生成 WARP 节点配置...${NC}"
     mkdir -p /etc/wireguard
     
@@ -213,10 +224,10 @@ setup_warp_profile() {
     local PUBKEY
     PUBKEY=$(echo "$PRIVKEY" | wg pubkey 2>/dev/null)
 
-    # 强制 -4 IPv4 请求 Cloudflare 注册 API
+    # 强制 -4 IPv4 请求 Cloudflare 注册 API (指定 en_US 语言)
     local RESPONSE
     RESPONSE=$(curl -4 -s -X POST -H 'User-Agent: okhttp/3.12.1' -H 'CF-Client-Version: a-6.3-2158' -H 'Content-Type: application/json' \
-      -d "{\"key\":\"$PUBKEY\",\"install_id\":\"\",\"fcm_token\":\"\",\"tos\":\"$(date -u +%Y-%m-%dT%H:%M:%S.000Z)\",\"model\":\"PC\",\"serial_number\":\"\",\"locale\":\"zh_CN\"}" \
+      -d "{\"key\":\"$PUBKEY\",\"install_id\":\"\",\"fcm_token\":\"\",\"tos\":\"$(date -u +%Y-%m-%dT%H:%M:%S.000Z)\",\"model\":\"PC\",\"serial_number\":\"\",\"locale\":\"en_US\"}" \
       https://api.cloudflareclient.com/v0a2158/reg)
 
     local IPV4_ADDR
@@ -240,23 +251,22 @@ setup_warp_profile() {
         exit 1
     fi
 
-    # Table = off: 不接管系统全局默认路由，显式设置 MTU=1280 杜绝握手大包分片黑洞
+    # 不添加 DNS 避免触发 resolvconf 权限冲突，显式设置 MTU=1280 杜绝握手大包分片黑洞
     cat > /etc/wireguard/warp0.conf << EOF
 [Interface]
 PrivateKey = $PRIVKEY
 Address = ${IPV4_ADDR}/32, ${IPV6_ADDR:-2606:4700:110:8::1}/128
-DNS = 1.1.1.1, 8.8.8.8
 MTU = 1280
 Table = off
 
 [Peer]
 PublicKey = ${PEER_PUBKEY:-bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=}
-Endpoint = 162.159.192.1:2408
+Endpoint = $TARGET_EP
 AllowedIPs = 0.0.0.0/0, ::/0
 PersistentKeepalive = 25
 EOF
 
-    echo -e "${GREEN}✓ Cloudflare WARP 节点配置已生成${NC}"
+    echo -e "${GREEN}✓ Cloudflare WARP 节点配置已生成 (Endpoint: $TARGET_EP)${NC}"
 }
 
 # ---------------------------------------------------------
@@ -398,6 +408,67 @@ EOF
 }
 
 # ---------------------------------------------------------
+# 核心功能：全自动刷 IP 机制 (避开俄罗斯 RU 与中国 CN，锁定美区)
+# ---------------------------------------------------------
+ensure_clean_warp_region() {
+    echo -e "\n${CYAN}正在验证 WARP 出口归属并自动避开俄罗斯(RU)/中国(CN)...${NC}"
+    
+    local max_retries=6
+    local retry_count=0
+    local ep_count=${#WARP_ENDPOINTS[@]}
+    local CUR_REGION=""
+    local GOOGLE_LOC=""
+
+    while [ $retry_count -lt $max_retries ]; do
+        sleep 2
+        # 预热 DNS
+        curl -sSL -4 --max-time 6 "https://www.youtube.com/premium" >/dev/null 2>&1
+        curl -sSL -4 --max-time 6 "https://www.google.com" >/dev/null 2>&1
+        
+        # 探测当前 WARP 出口的 YouTube 归属
+        local YT_TEST
+        YT_TEST=$(curl -sSL -4 --max-time 8 \
+            -H "Accept-Language: en" \
+            -b "YSC=BiCUU3-5Gdk; CONSENT=YES+cb.20220301-11-p0.en+FX+700; GPS=1; VISITOR_INFO1_LIVE=4VwPMkB7W5A; PREF=tz=Asia.Shanghai" \
+            "https://www.youtube.com/premium" 2>&1)
+        CUR_REGION=$(echo "$YT_TEST" | sed -n 's/.*"contentRegion":"\([^"]*\)".*/\1/p' | head -n 1)
+
+        # 探测 Google 搜索归属
+        local GOOGLE_PAGE
+        GOOGLE_PAGE=$(curl -sL -4 --max-time 8 -H "Accept-Language: en-US,en" "https://www.google.com" 2>/dev/null)
+        GOOGLE_LOC=$(echo "$GOOGLE_PAGE" | grep -oP '\[1,null,null,\d+,\d+,"\K[A-Z]{3}' | head -n 1)
+
+        # 判定是否为受限地区 (RU / CN / CHN / RUS)
+        local IS_RESTRICTED=0
+        if [ "$CUR_REGION" == "RU" ] || [ "$CUR_REGION" == "CN" ] || echo "$YT_TEST" | grep -q "www.google.cn"; then
+            IS_RESTRICTED=1
+        elif [ "$GOOGLE_LOC" == "RUS" ] || [ "$GOOGLE_LOC" == "CHN" ]; then
+            IS_RESTRICTED=1
+        fi
+
+        if [ $IS_RESTRICTED -eq 1 ]; then
+            ((retry_count++))
+            echo -e "${YELLOW}[尝试 $retry_count/$max_retries] WARP 当前分配至 [${CUR_REGION:-$GOOGLE_LOC}] (俄罗斯/中国限制区，Gemini不可用)，正在自动刷新获取新 IP...${NC}"
+            
+            # 选择下一个 Endpoint
+            local next_ep=${WARP_ENDPOINTS[$((retry_count % ep_count))]}
+            
+            # 重新生成配置并重启 WireGuard
+            setup_warp_profile "$next_ep"
+            wg-quick down warp0 2>/dev/null || true
+            wg-quick up warp0
+            [ -d /proc/sys/net/ipv4/conf/warp0 ] && sysctl -w net.ipv4.conf.warp0.rp_filter=2 >/dev/null 2>&1
+        else
+            echo -e "${GREEN}✓ 成功锁定 WARP 纯净出口地区: [${CUR_REGION:-${GOOGLE_LOC:-US}}] (非受限区，完美支持 Google / Gemini / YouTube！)${NC}"
+            return 0
+        fi
+    done
+
+    echo -e "${YELLOW}⚠ 已达自动重试上限，当前 WARP 地区为 [${CUR_REGION:-未知}]${NC}"
+    return 1
+}
+
+# ---------------------------------------------------------
 # 测试解锁状态
 # ---------------------------------------------------------
 test_unlock_status() {
@@ -422,9 +493,13 @@ test_unlock_status() {
     local GOOGLE_CODE
     GOOGLE_CODE=$(curl -sI -o /dev/null -w "%{http_code}" -L --max-time 8 https://www.google.com/ncr)
     
-    # 3. 验证 Gemini / Antigravity
-    local GEMINI_CODE
-    GEMINI_CODE=$(curl -sI -o /dev/null -w "%{http_code}" -L --max-time 8 https://gemini.google.com)
+    # 3. 验证 Gemini / Antigravity (检测地区是否支持)
+    local GEMINI_RES
+    GEMINI_RES=$(curl -sL -4 --max-time 8 -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" -H "Accept-Language: en-US,en" https://gemini.google.com 2>&1)
+    local GEMINI_OK=1
+    if echo "$GEMINI_RES" | grep -qiE "not supported in your country|country_unavailable|not available in your region"; then
+        GEMINI_OK=0
+    fi
 
     # 4. 验证 OpenAI / ChatGPT
     local CHATGPT_CODE
@@ -434,7 +509,9 @@ test_unlock_status() {
     echo -e "               🎉 解锁与脱离送中验证报告                 "
     echo "========================================================"
     
-    if echo "$YT_TEST" | grep -q "www.google.cn"; then
+    if [ "$YT_REG" == "RU" ]; then
+        echo -e "YouTube Premium 归属:        ${YELLOW}⚠ 归属俄罗斯 [RU] (免广告但 Gemini 不支持，建议选菜单 5 刷新)${NC}"
+    elif echo "$YT_TEST" | grep -q "www.google.cn"; then
         echo -e "YouTube Premium 解锁:        ${RED}✗ 仍显示送中 (请检查 WARP 运行状态)${NC}"
     else
         echo -e "YouTube Premium 解锁:        ${GREEN}✓ 成功脱离送中 (当前归属: [${YT_REG:-US}])${NC}"
@@ -446,10 +523,10 @@ test_unlock_status() {
         echo -e "Google 搜索/API 解锁:        ${YELLOW}⚠ 状态码: $GOOGLE_CODE (200/302均属正常)${NC}"
     fi
 
-    if [ "$GEMINI_CODE" == "200" ] || [ "$GEMINI_CODE" == "302" ]; then
-        echo -e "Google Gemini / Antigravity: ${GREEN}✓ 解锁成功 (HTTP $GEMINI_CODE)${NC}"
+    if [ $GEMINI_OK -eq 1 ]; then
+        echo -e "Google Gemini / Antigravity: ${GREEN}✓ 正常可用 (地区已解锁)${NC}"
     else
-        echo -e "Google Gemini / Antigravity: ${RED}✗ 异常 (HTTP $GEMINI_CODE)${NC}"
+        echo -e "Google Gemini / Antigravity: ${RED}✗ 当前地区受限 (不可用，建议选菜单 5 刷新)${NC}"
     fi
 
     if [ "$CHATGPT_CODE" == "200" ] || [ "$CHATGPT_CODE" == "302" ] || [ "$CHATGPT_CODE" == "403" ]; then
@@ -458,7 +535,7 @@ test_unlock_status() {
         echo -e "OpenAI / ChatGPT 访问状态:   ${YELLOW}⚠ 状态码: $CHATGPT_CODE${NC}"
     fi
     echo "========================================================"
-    echo -e "${GREEN}🎉 部署完成！您现在可以重新运行 NodeQuality 进行复测，YouTube 将完美脱离 [CN]！${NC}\n"
+    echo -e "${GREEN}🎉 部署完成！若需更换出口地区，可随时运行脚本选择选项 [5] 智能刷 IP！${NC}\n"
 }
 
 # ---------------------------------------------------------
@@ -475,6 +552,7 @@ smart_install_flow() {
         setup_warp_profile
         setup_dnsmasq_rules
         setup_routing_rules
+        ensure_clean_warp_region
         test_unlock_status
     else
         echo -e "\n${GREEN}======================================================${NC}"
@@ -490,6 +568,7 @@ smart_install_flow() {
                 setup_warp_profile
                 setup_dnsmasq_rules
                 setup_routing_rules
+                ensure_clean_warp_region
                 test_unlock_status
                 ;;
             *)
@@ -508,6 +587,7 @@ echo "╔═══════════════════════�
 echo "║      🚀 VPS 系统级 WARP 智能动态解锁脚本 (升级版)          ║"
 echo "║   • 启动自检：自动彻底清理老版本脚本及旧规则残留          ║"
 echo "║   • 智能判断：原生送中才安装，未送中则自动免装/可自选     ║"
+echo "║   • 避俄防送：智能刷 IP，自动规避俄罗斯/中国等受限地区    ║"
 echo "║   • 动态嗅探：Google全家桶/YouTube/Gemini/Antigravity/AI   ║"
 echo "║   • 防覆写：锁定 DNS 属性，彻底防止重启或 DHCP 导致失效   ║"
 echo "║   • 零配置：小白直接运行，各代理节点无需任何路由改动       ║"
@@ -518,9 +598,10 @@ echo "1. 智能运行 (自动清理旧版 + 精准检测送中 + 智能安装)"
 echo "2. 强制安装 / 修复 WARP 动态解锁"
 echo "3. 测试当前解锁与归属状态"
 echo "4. 彻底卸载恢复原生网络"
+echo "5. 智能刷新 WARP 出口 IP (自动避开俄罗斯/中国，刷美区)"
 echo "0. 退出"
 echo ""
-read -p "请输入选项 [0-4] (默认按回车直接智能运行 [1]): " choice
+read -p "请输入选项 [0-5] (默认按回车直接智能运行 [1]): " choice
 choice=${choice:-1}
 
 case $choice in
@@ -533,6 +614,7 @@ case $choice in
         setup_warp_profile
         setup_dnsmasq_rules
         setup_routing_rules
+        ensure_clean_warp_region
         test_unlock_status
         ;;
     3)
@@ -542,6 +624,10 @@ case $choice in
     4)
         auto_clean_old_warp
         echo -e "${GREEN}✓ 已彻底卸载并恢复原生网络配置。${NC}"
+        ;;
+    5)
+        ensure_clean_warp_region
+        test_unlock_status
         ;;
     *)
         exit 0
