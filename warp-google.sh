@@ -50,7 +50,7 @@ EOF
     command -v wg-quick &>/dev/null && wg-quick down warp0 2>/dev/null || true
     command -v warp-cli &>/dev/null && warp-cli disconnect 2>/dev/null || true
 
-    # 4. 彻底循环清理所有 iptables mangle / nat 规则 (while 循环清空，一条不剩)
+    # 4. 彻底循环清理所有 iptables mangle / nat / filter 规则 (while 循环清空，一条不剩)
     while iptables -t mangle -D OUTPUT -m set --match-set warp_unlock dst -j MARK --set-mark 51820 2>/dev/null; do :; done
     while iptables -t mangle -D PREROUTING -m set --match-set warp_unlock dst -j MARK --set-mark 51820 2>/dev/null; do :; done
     while iptables -t mangle -D POSTROUTING -p tcp --tcp-flags SYN,RST SYN -o warp0 -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null; do :; done
@@ -60,6 +60,8 @@ EOF
     while iptables -t nat -D OUTPUT -p udp --dport 53 -d 127.0.0.1 -j ACCEPT 2>/dev/null; do :; done
     while iptables -t nat -D OUTPUT -p udp --dport 53 -j REDIRECT --to-ports 53 2>/dev/null; do :; done
     while iptables -t nat -D OUTPUT -p tcp --dport 53 -j REDIRECT --to-ports 53 2>/dev/null; do :; done
+    while iptables -t filter -D FORWARD -p udp --dport 443 -m set --match-set warp_unlock dst -j REJECT --reject-with icmp-port-unreachable 2>/dev/null; do :; done
+    while iptables -t filter -D OUTPUT -p udp --dport 443 -m set --match-set warp_unlock dst -j REJECT --reject-with icmp-port-unreachable 2>/dev/null; do :; done
 
     # 5. 彻底循环清理策略路由表与规则
     while ip rule del fwmark 51820 lookup 51820 2>/dev/null; do :; done
@@ -317,23 +319,33 @@ ipset=/chatgpt.com/warp_unlock
 ipset=/oaistatic.com/warp_unlock
 ipset=/oaiusercontent.com/warp_unlock
 ipset=/auth0.openai.com/warp_unlock
+
+# 过滤 IPv6 (AAAA) 解析，强制 Google/YouTube 走 IPv4 策略路由，避免代理走未分流的 IPv6 导致送中
+filter-aaaa
 EOF
 
-    # 避免 Ubuntu 等系统 systemd-resolved 占用 53 端口
-    if systemctl is-active --quiet systemd-resolved 2>/dev/null; then
-        sed -i 's/#DNSStubListener=yes/DNSStubListener=no/g' /etc/systemd/resolved.conf 2>/dev/null || true
-        sed -i 's/DNSStubListener=yes/DNSStubListener=no/g' /etc/systemd/resolved.conf 2>/dev/null || true
-        systemctl restart systemd-resolved 2>/dev/null || true
+    # 彻底停用 systemd-resolved 释放 53 端口，杜绝 Dnsmasq 启动失败
+    if systemctl is-enabled systemd-resolved &>/dev/null || systemctl is-active systemd-resolved &>/dev/null; then
+        systemctl stop systemd-resolved 2>/dev/null || true
+        systemctl disable systemd-resolved 2>/dev/null || true
     fi
 
     systemctl restart dnsmasq
     systemctl enable dnsmasq >/dev/null 2>&1
     
-    # 写入本机 DNS 并使用 chattr +i 锁死，彻底杜绝 DHCP / 重启覆写导致失效
+    # 确保 /etc/resolv.conf 独立文件并锁定
     chattr -i /etc/resolv.conf 2>/dev/null || true
+    rm -f /etc/resolv.conf
     echo "nameserver 127.0.0.1" > /etc/resolv.conf
     chattr +i /etc/resolv.conf 2>/dev/null || true
-    echo -e "${GREEN}✓ DNS 嗅探配置生效，并已锁定 /etc/resolv.conf 防止 DHCP 覆盖失效${NC}"
+
+    # 严格验证 Dnsmasq 运行状态
+    if systemctl is-active --quiet dnsmasq; then
+        echo -e "${GREEN}✓ DNS 动态嗅探组件运行正常，并已锁定 /etc/resolv.conf 防止 DHCP 覆盖${NC}"
+    else
+        echo -e "${RED}[警告] Dnsmasq 服务未正常启动，正在尝试恢复...${NC}"
+        systemctl restart dnsmasq 2>/dev/null || true
+    fi
 }
 
 # ---------------------------------------------------------
@@ -383,6 +395,12 @@ iptables -t mangle -A POSTROUTING -p tcp --tcp-flags SYN,RST SYN -o warp0 -j TCP
 # 7. NAT MASQUERADE (最核心修复: 为 warp0 出口流量执行源地址伪装，避免源 IP 错误被丢弃)
 iptables -t nat -D POSTROUTING -o warp0 -j MASQUERADE 2>/dev/null || true
 iptables -t nat -A POSTROUTING -o warp0 -j MASQUERADE
+
+# 8. 强制拦截 QUIC (UDP 443)，促使 Chrome/Edge 浏览器瞬间回落至极速稳定的 TCP (TLS 1.3)
+iptables -t filter -D FORWARD -p udp --dport 443 -m set --match-set warp_unlock dst -j REJECT --reject-with icmp-port-unreachable 2>/dev/null || true
+iptables -t filter -A FORWARD -p udp --dport 443 -m set --match-set warp_unlock dst -j REJECT --reject-with icmp-port-unreachable
+iptables -t filter -D OUTPUT -p udp --dport 443 -m set --match-set warp_unlock dst -j REJECT --reject-with icmp-port-unreachable 2>/dev/null || true
+iptables -t filter -A OUTPUT -p udp --dport 443 -m set --match-set warp_unlock dst -j REJECT --reject-with icmp-port-unreachable
 EOF
     chmod +x /usr/local/bin/warp-route-apply.sh
     /usr/local/bin/warp-route-apply.sh
