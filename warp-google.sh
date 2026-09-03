@@ -197,12 +197,12 @@ install_dependencies() {
 
 # 候选优质 WARP Endpoint 列表 (覆盖主流优质节点)
 WARP_ENDPOINTS=(
-    "162.159.193.10:2408"
     "162.159.192.1:2408"
-    "162.159.195.1:2408"
+    "162.159.192.1:500"
+    "162.159.193.10:2408"
+    "162.159.193.10:500"
     "188.114.96.1:2408"
     "188.114.97.1:2408"
-    "188.114.98.1:2408"
 )
 
 # ---------------------------------------------------------
@@ -427,53 +427,20 @@ done
 ip rule del fwmark 51820 lookup 51820 2>/dev/null || true
 ip rule add fwmark 51820 lookup 51820 priority 100
 
-# 3. 启动 WireGuard 虚拟网卡并验证握手
-wg-quick down warp0 2>/dev/null || true
-wg-quick up warp0
+# 3. 启动 WireGuard 虚拟网卡并进行热切换极速握手
+wg-quick down warp0 >/dev/null 2>&1 || true
+wg-quick up warp0 >/dev/null 2>&1
 
-# 关键: 等待 WireGuard 握手完成 (最多等 8 秒)
-HANDSHAKE_OK=0
-for i in $(seq 1 8); do
-    sleep 1
-    if wg show warp0 2>/dev/null | grep -q "latest handshake"; then
-        HANDSHAKE_OK=1
+# 极速热探测黄金接入点与端口 (秒级生效)
+for ep in "162.159.192.1:2408" "162.159.192.1:500" "162.159.193.10:2408" "162.159.193.10:500" "188.114.96.1:2408" "188.114.97.1:2408"; do
+    wg set warp0 peer bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo= endpoint "$ep" 2>/dev/null || true
+    sleep 2
+    RX=$(wg show warp0 transfer 2>/dev/null | awk '{print $2}')
+    if [ -n "$RX" ] && [ "$RX" -gt 0 ]; then
+        sed -i "s|Endpoint = .*|Endpoint = $ep|" /etc/wireguard/warp0.conf
         break
     fi
 done
-
-# 如果握手失败，自动尝试不同端口 (500/1701/4500)
-if [ $HANDSHAKE_OK -eq 0 ]; then
-    CURRENT_EP=$(grep 'Endpoint' /etc/wireguard/warp0.conf | awk '{print $3}')
-    CURRENT_HOST=$(echo "$CURRENT_EP" | cut -d: -f1)
-    for ALT_PORT in 500 1701 4500 2408; do
-        wg-quick down warp0 >/dev/null 2>&1 || true
-        sed -i "s|Endpoint = .*|Endpoint = ${CURRENT_HOST}:${ALT_PORT}|" /etc/wireguard/warp0.conf
-        wg-quick up warp0 >/dev/null 2>&1
-        for j in $(seq 1 4); do
-            sleep 1
-            if wg show warp0 2>/dev/null | grep -q "latest handshake"; then
-                HANDSHAKE_OK=1
-                break 2
-            fi
-        done
-    done
-fi
-
-# 如果所有端口都失败，尝试不同的 Endpoint IP
-if [ $HANDSHAKE_OK -eq 0 ]; then
-    for ALT_EP in 162.159.192.1:2408 162.159.195.1:2408 188.114.96.1:2408 188.114.97.1:2408; do
-        wg-quick down warp0 >/dev/null 2>&1 || true
-        sed -i "s|Endpoint = .*|Endpoint = ${ALT_EP}|" /etc/wireguard/warp0.conf
-        wg-quick up warp0 >/dev/null 2>&1
-        for j in $(seq 1 4); do
-            sleep 1
-            if wg show warp0 2>/dev/null | grep -q "latest handshake"; then
-                HANDSHAKE_OK=1
-                break 2
-            fi
-        done
-    done
-fi
 
 [ -d /proc/sys/net/ipv4/conf/warp0 ] && sysctl -w net.ipv4.conf.warp0.rp_filter=2 >/dev/null 2>&1
 
