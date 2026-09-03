@@ -219,17 +219,15 @@ setup_warp_profile() {
       -d "{\"key\":\"$PUBKEY\",\"install_id\":\"\",\"fcm_token\":\"\",\"tos\":\"$(date -u +%Y-%m-%dT%H:%M:%S.000Z)\",\"model\":\"PC\",\"serial_number\":\"\",\"locale\":\"en_US\"}" \
       https://api.cloudflareclient.com/v0a2158/reg)
 
-    local IPV4_ADDR
-    # 核心修复: 必须精准抓取 interface 字段下的内网地址 (恒为 172.16.0.2)，绝不能误抓 endpoint 的公网 IP
-    IPV4_ADDR=$(echo "$RESPONSE" | grep -A 8 '"interface"' | grep -oP '"v4":\s*"\K[0-9.]+' | head -n 1)
-    IPV4_ADDR=${IPV4_ADDR:-172.16.0.2}
+    # Cloudflare WARP 客户端内网 IPv4 规范恒为 172.16.0.2 (杜绝单行 JSON 抓错 endpoint 公网 IP)
+    local IPV4_ADDR="172.16.0.2"
 
     local IPV6_ADDR
-    IPV6_ADDR=$(echo "$RESPONSE" | grep -A 8 '"interface"' | grep -oP '"v6":\s*"\K[0-9a-fA-F:]+' | head -n 1)
+    IPV6_ADDR=$(echo "$RESPONSE" | grep -oP '"addresses"\s*:\s*\{[^}]*"v6"\s*:\s*"\K[0-9a-fA-F:]+' | head -n 1)
     IPV6_ADDR=${IPV6_ADDR:-2606:4700:110:8827:18b5:2de8:8b53:96e3}
 
     local PEER_PUBKEY
-    PEER_PUBKEY=$(echo "$RESPONSE" | grep -oP '"public_key":\s*"\K[^"]+' | head -n 1)
+    PEER_PUBKEY=$(echo "$RESPONSE" | grep -oP '"public_key"\s*:\s*"\K[^"]+' | head -n 1)
     PEER_PUBKEY=${PEER_PUBKEY:-bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=}
 
     # 备用 API 兜底
@@ -237,9 +235,12 @@ setup_warp_profile() {
         RESPONSE=$(curl -4 -s -X POST -H 'User-Agent: okhttp/3.12.1' -H 'Content-Type: application/json' \
           -d "{\"key\":\"$PUBKEY\",\"tos\":\"$(date -u +%Y-%m-%dT%H:%M:%S.000Z)\"}" \
           https://api.cloudflareclient.com/v0a884/reg)
-        IPV4_ADDR=$(echo "$RESPONSE" | grep -A 8 '"interface"' | grep -oP '"v4":\s*"\K[0-9.]+' | head -n 1)
-        IPV4_ADDR=${IPV4_ADDR:-172.16.0.2}
-        PEER_PUBKEY=$(echo "$RESPONSE" | grep -oP '"public_key":\s*"\K[^"]+' | head -n 1)
+        local V6_BACKUP
+        V6_BACKUP=$(echo "$RESPONSE" | grep -oP '"addresses"\s*:\s*\{[^}]*"v6"\s*:\s*"\K[0-9a-fA-F:]+' | head -n 1)
+        [ -n "$V6_BACKUP" ] && IPV6_ADDR="$V6_BACKUP"
+        local PUB_BACKUP
+        PUB_BACKUP=$(echo "$RESPONSE" | grep -oP '"public_key"\s*:\s*"\K[^"]+' | head -n 1)
+        [ -n "$PUB_BACKUP" ] && PEER_PUBKEY="$PUB_BACKUP"
     fi
 
     if [ -z "$PEER_PUBKEY" ]; then
