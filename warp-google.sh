@@ -60,9 +60,11 @@ auto_clean_old_warp() {
         command -v wg-quick &>/dev/null && wg-quick down warp0 2>/dev/null || true
         command -v warp-cli &>/dev/null && warp-cli disconnect 2>/dev/null || true
 
-        # 4. 清理 iptables mangle 规则与策略路由
+        # 4. 清理 iptables mangle/nat 规则与策略路由
         iptables -t mangle -D OUTPUT -m set --match-set warp_unlock dst -j MARK --set-mark 51820 2>/dev/null || true
         iptables -t mangle -D PREROUTING -m set --match-set warp_unlock dst -j MARK --set-mark 51820 2>/dev/null || true
+        iptables -t mangle -D POSTROUTING -p tcp --tcp-flags SYN,RST SYN -o warp0 -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true
+        iptables -t nat -D POSTROUTING -o warp0 -j MASQUERADE 2>/dev/null || true
         ip rule del fwmark 51820 lookup 51820 2>/dev/null || true
         ip route flush table 51820 2>/dev/null || true
 
@@ -93,10 +95,10 @@ auto_clean_old_warp() {
 }
 
 # ---------------------------------------------------------
-# 功能 2：权威精准探测原生 IP 是否送中 (对齐 NodeQuality 算法)
+# 功能 2：权威精准探测原生 IP 是否送中 (Google 官网底栏 + YouTube 深度双判)
 # ---------------------------------------------------------
 check_native_songzhong() {
-    echo -e "${CYAN}[检测] 正在通过权威多维接口深度探测当前 VPS 原生 IP 归属状态...${NC}"
+    echo -e "${CYAN}[检测] 正在深度探测当前 VPS 原生 IP 的 Google / YouTube 真实归属...${NC}"
     
     # 绑定默认网卡，确保探测的是 VPS 真实原生出口
     local IFACE_ARG=""
@@ -111,10 +113,41 @@ check_native_songzhong() {
 
     local IS_SONGZHONG=0
     local REASON=""
+    local GOOGLE_GEO=""
     local YT_REGION=""
 
     # -------------------------------------------------------------
-    # 核心探测 1：YouTube Premium 接口检测 (NodeQuality 行业黄金标准)
+    # 核心探测 1：Google 首页前端配置与底栏归属判定 (用户浏览器同款标准)
+    # -------------------------------------------------------------
+    echo -e "${CYAN}[检测] 正在访问 Google 搜索官网提取底层归属地区...${NC}"
+    local GOOGLE_PAGE
+    GOOGLE_PAGE=$(curl -sL -4 --max-time 8 $IFACE_ARG \
+        -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
+        -H "Accept-Language: en-US,en" \
+        "https://www.google.com" 2>/dev/null)
+
+    # 提取 Google 下发给前端的 ISO-3166 国家代码 (如 USA, CHN, HKG 等)
+    GOOGLE_GEO=$(echo "$GOOGLE_PAGE" | grep -oP '\[1,null,null,\d+,\d+,"\K[A-Z]{3}' | head -n 1)
+    [ -z "$GOOGLE_GEO" ] && GOOGLE_GEO=$(echo "$GOOGLE_PAGE" | grep -oP '2,1,200,"\K[A-Z]{3}' | head -n 1)
+
+    local GOOGLE_HEADER
+    GOOGLE_HEADER=$(curl -sI -4 --max-time 6 $IFACE_ARG "https://www.google.com" 2>/dev/null)
+    local LOCATION
+    LOCATION=$(echo "$GOOGLE_HEADER" | grep -i "^location:" | awk '{print $2}' | tr -d '\r')
+
+    if [ "$GOOGLE_GEO" == "CHN" ] || [ "$GOOGLE_GEO" == "HKG" ]; then
+        IS_SONGZHONG=1
+        REASON="Google 搜索底层识别地区为中国/香港 ($GOOGLE_GEO)"
+    elif echo "$LOCATION" | grep -qiE "google\.com\.hk|google\.cn"; then
+        IS_SONGZHONG=1
+        REASON="Google 搜索被强制重定向至 $LOCATION"
+    elif echo "$GOOGLE_PAGE" | grep -qiE '"gl":"cn"|"gl":"hk"'; then
+        IS_SONGZHONG=1
+        REASON="Google 页面标注地区为中国 (gl: cn/hk)"
+    fi
+
+    # -------------------------------------------------------------
+    # 核心探测 2：YouTube Premium 区域接口 (NodeQuality 行业标准)
     # -------------------------------------------------------------
     echo -e "${CYAN}[检测] 正在请求 YouTube 官方区域接口 (NodeQuality 同款)...${NC}"
     local YT_RES
@@ -123,50 +156,29 @@ check_native_songzhong() {
         -b "YSC=BiCUU3-5Gdk; CONSENT=YES+cb.20220301-11-p0.en+FX+700; GPS=1; VISITOR_INFO1_LIVE=4VwPMkB7W5A; PREF=tz=Asia.Shanghai" \
         "https://www.youtube.com/premium" 2>&1)
 
-    # 提取区域代码
     YT_REGION=$(echo "$YT_RES" | sed -n 's/.*"contentRegion":"\([^"]*\)".*/\1/p' | head -n 1)
 
-    # 判定规则 A：页面包含 www.google.cn
     if echo "$YT_RES" | grep -q "www.google.cn"; then
         IS_SONGZHONG=1
-        REASON="YouTube 源码包含 www.google.cn 域名引用"
-    # 判定规则 B：地区标记明确为 CN
+        REASON="${REASON:-YouTube 源码引用 www.google.cn}"
     elif echo "$YT_RES" | grep -qiE '"countryCode":"CN"|"contentRegion":"CN"'; then
         IS_SONGZHONG=1
-        REASON="YouTube 接口返回归属地为 [CN] (中国)"
-    # 判定规则 C：中国区不可用提示
-    elif echo "$YT_RES" | grep -q "Premium is not available in your country" && [ "$YT_REGION" == "CN" ]; then
-        IS_SONGZHONG=1
-        REASON="YouTube Premium 提示所在地区不支持 (CN)"
+        REASON="${REASON:-YouTube 接口返回归属地为 [CN]}"
     fi
 
     # -------------------------------------------------------------
-    # 辅助探测 2：Google 搜索重定向与 NCR 检测
-    # -------------------------------------------------------------
-    local GOOGLE_HEADER
-    GOOGLE_HEADER=$(curl -sI -4 --max-time 6 $IFACE_ARG "https://www.google.com" 2>/dev/null)
-    local LOCATION
-    LOCATION=$(echo "$GOOGLE_HEADER" | grep -i "^location:" | awk '{print $2}' | tr -d '\r')
-
-    if echo "$LOCATION" | grep -qiE "google\.com\.hk|google\.cn"; then
-        IS_SONGZHONG=1
-        REASON="Google 搜索被强制重定向至 $LOCATION"
-    fi
-
-    # -------------------------------------------------------------
-    # 输出结果汇总
+    # 输出探测汇总
     # -------------------------------------------------------------
     echo "--------------------------------------------------------"
+    echo -e "Google 搜索定位国家: ${YELLOW}${GOOGLE_GEO:-未知}${NC}"
+    echo -e "YouTube 接口返回地区: ${YELLOW}[${YT_REGION:-未知}]${NC}"
     if [ $IS_SONGZHONG -eq 1 ]; then
-        echo -e "YouTube 状态判定:  ${RED}中国 [CN]${NC} (与 NodeQuality 检测一致)"
-        echo -e "送中特征详情:      ${RED}$REASON${NC}"
-        echo -e "综合归属判定:      ${RED}🔴 已确认送中 (Google/YouTube 判定为中国地区)${NC}"
+        echo -e "送中特征详情:        ${RED}$REASON${NC}"
+        echo -e "综合归属判定:        ${RED}🔴 已确认送中 (部分或全部服务受限)${NC}"
         echo "--------------------------------------------------------"
-        return 0 # 0 代表已送中，需要安装解锁
+        return 0 # 0 代表已送中
     else
-        echo -e "YouTube 状态判定:  ${GREEN}[${YT_REGION:-US}] 原生正常解锁${NC}"
-        echo -e "Google 搜索判定:   ${GREEN}正常直连 (无区域重定向)${NC}"
-        echo -e "综合归属判定:      ${GREEN}🟢 原生正常 / 未送中${NC}"
+        echo -e "综合归属判定:        ${GREEN}🟢 原生定位良好 (未送中)${NC}"
         echo "--------------------------------------------------------"
         return 1 # 1 代表未送中
     fi
@@ -228,12 +240,13 @@ setup_warp_profile() {
         exit 1
     fi
 
-    # Table = off: 不接管系统全局默认路由
+    # Table = off: 不接管系统全局默认路由，显式设置 MTU=1280 杜绝握手大包分片黑洞
     cat > /etc/wireguard/warp0.conf << EOF
 [Interface]
 PrivateKey = $PRIVKEY
 Address = ${IPV4_ADDR}/32, ${IPV6_ADDR:-2606:4700:110:8::1}/128
 DNS = 1.1.1.1, 8.8.8.8
+MTU = 1280
 Table = off
 
 [Peer]
@@ -328,6 +341,11 @@ setup_routing_rules() {
 
     cat > /usr/local/bin/warp-route-apply.sh << 'EOF'
 #!/bin/bash
+# 0. 开启内核转发与优化反向路径过滤 (避免策略路由回包被内核阻断)
+sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1
+sysctl -w net.ipv4.conf.all.rp_filter=2 >/dev/null 2>&1
+sysctl -w net.ipv4.conf.default.rp_filter=2 >/dev/null 2>&1
+
 # 1. 创建 ipset 集合 (86400秒动态过期自动刷新)
 ipset create warp_unlock hash:ip timeout 86400 -exist
 
@@ -335,9 +353,10 @@ ipset create warp_unlock hash:ip timeout 86400 -exist
 ip rule del fwmark 51820 lookup 51820 2>/dev/null || true
 ip rule add fwmark 51820 lookup 51820 priority 100
 
-# 3. 启动 WireGuard 虚拟网卡
+# 3. 启动 WireGuard 虚拟网卡并设置网卡级别 rp_filter
 wg-quick down warp0 2>/dev/null || true
 wg-quick up warp0
+[ -d /proc/sys/net/ipv4/conf/warp0 ] && sysctl -w net.ipv4.conf.warp0.rp_filter=2 >/dev/null 2>&1
 
 # 4. 指定 51820 路由表的默认网关为 warp0 虚拟接口
 ip route flush table 51820 2>/dev/null || true
@@ -348,6 +367,14 @@ iptables -t mangle -D OUTPUT -m set --match-set warp_unlock dst -j MARK --set-ma
 iptables -t mangle -A OUTPUT -m set --match-set warp_unlock dst -j MARK --set-mark 51820
 iptables -t mangle -D PREROUTING -m set --match-set warp_unlock dst -j MARK --set-mark 51820 2>/dev/null || true
 iptables -t mangle -A PREROUTING -m set --match-set warp_unlock dst -j MARK --set-mark 51820
+
+# 6. TCP MSS 钳制 (核心修复: 解决 HTTPS / TLS Client Hello 大包导致 ERR_CONNECTION_CLOSED)
+iptables -t mangle -D POSTROUTING -p tcp --tcp-flags SYN,RST SYN -o warp0 -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true
+iptables -t mangle -A POSTROUTING -p tcp --tcp-flags SYN,RST SYN -o warp0 -j TCPMSS --clamp-mss-to-pmtu
+
+# 7. NAT MASQUERADE (最核心修复: 为 warp0 出口流量执行源地址伪装，避免源 IP 错误被丢弃)
+iptables -t nat -D POSTROUTING -o warp0 -j MASQUERADE 2>/dev/null || true
+iptables -t nat -A POSTROUTING -o warp0 -j MASQUERADE
 EOF
     chmod +x /usr/local/bin/warp-route-apply.sh
     /usr/local/bin/warp-route-apply.sh
@@ -451,12 +478,14 @@ smart_install_flow() {
         test_unlock_status
     else
         echo -e "\n${GREEN}======================================================${NC}"
-        echo -e "${GREEN}🎉 检测到当前 VPS 原生 IP 为纯净非送中 IP！${NC}"
+        echo -e "${GREEN}提示：原生 IP 基础定位未触发硬性跳转。${NC}"
+        echo -e "${YELLOW}但若您在浏览器访问 Google 仍未显示美国、或打不开 Gemini，强烈建议继续安装！${NC}"
         echo -e "${GREEN}======================================================${NC}"
-        read -t 10 -p "是否仍然需要强制安装 WARP 动态分流？[y/N] (10秒无输入默认退出保持原生): " force_choice
+        read -p "是否继续安装 WARP 动态分流？[Y/n] (默认直接按回车继续安装): " force_choice
+        force_choice=${force_choice:-y}
         case "$force_choice" in
             [yY][eE][sS]|[yY])
-                echo -e "\n${YELLOW}>>> 用户选择继续安装 WARP 动态分流...${NC}"
+                echo -e "\n${YELLOW}>>> 开始安装 WARP 动态分流解锁...${NC}"
                 install_dependencies
                 setup_warp_profile
                 setup_dnsmasq_rules
@@ -464,7 +493,7 @@ smart_install_flow() {
                 test_unlock_status
                 ;;
             *)
-                echo -e "\n已保持原生纯净直连，享受最低延迟与最佳性能。\n"
+                echo -e "\n已取消安装，保持原生网络状态。\n"
                 ;;
         esac
     fi
